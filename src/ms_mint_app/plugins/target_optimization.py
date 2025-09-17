@@ -734,7 +734,7 @@ def callbacks(app, fsc, cache, cpu=None):
         if trigger_id == 'save-btn' and unsaved_changes:
             targets = T.get_targets(wdir)
             rt_min, rt, rt_max = current_values
-            peak_label = targets.loc[targets['peak_label'] == image_clicked, ["peak_label"]].iloc[0]
+            peak_label = targets.loc[targets['peak_label'] == image_clicked, "peak_label"].iloc[0]
             T.update_targets(wdir, peak_label, rt_min, rt_max, rt)
 
             buttons_style = {
