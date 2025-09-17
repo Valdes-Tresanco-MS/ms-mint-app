@@ -45,7 +45,8 @@ dependencies = [
   "werkzeug==3.0.6",
   "packaging==21.3.0",
   "email-validator",
-  "feffery-antd-components==0.4.2"
+  "feffery-antd-components==0.4.2",
+  "plotly-resampler==0.11.0"
 ]
 dynamic = ["version"]
 
