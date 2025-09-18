@@ -25,7 +25,7 @@ classifiers = [
   "Operating System :: OS Independent"
 ]
 dependencies = [
-  "ms-mint>=1.1.1",
+  "ms-mint @ git+https://github.com/Valdes-Tresanco-MS/ms-mint.git",
   "xlsxwriter",
   "waitress",
   "dash",
