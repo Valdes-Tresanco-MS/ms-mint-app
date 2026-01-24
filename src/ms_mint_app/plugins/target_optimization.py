@@ -14,7 +14,8 @@ from dash import html, dcc, Patch
 from dash.dependencies import Input, Output, State, ALL
 from dash.exceptions import PreventUpdate
 
-from ..duckdb_manager import duckdb_connection, compute_chromatograms_in_batches, calculate_optimal_batch_size
+from ..duckdb_manager import duckdb_connection, compute_chromatograms_in_batches, calculate_optimal_batch_size, \
+    compute_chromatograms_optimized
 from ..plugin_interface import PluginInterface
 from ..tools import sparsify_chrom, proportional_min1_selection
 from ..plugins.analysis_tools.trace_helper import generate_chromatogram_traces, calculate_rt_alignment, calculate_shifts_per_sample_type
@@ -1303,9 +1304,14 @@ def _compute_chromatograms_logic(set_progress, recompute_ms1, recompute_ms2, n_c
         start = time.perf_counter()
         logger.info("Starting chromatogram computation.")
         progress_adapter(0, "Chromatograms", "Preparing batches...")
-        compute_chromatograms_in_batches(wdir, use_for_optimization=True, batch_size=batch_size,
-                                            set_progress=progress_adapter, recompute_ms1=recompute_ms1,
-                                            recompute_ms2=recompute_ms2, n_cpus=n_cpus, ram=ram)
+
+
+        compute_chromatograms_optimized(wdir, use_for_optimization=True, checkpoint_every=10,
+                                        set_progress=progress_adapter, recompute_ms1=recompute_ms1,
+                                            recompute_ms2=recompute_ms2, n_cpus=n_cpus, ram=ram, pairs_per_cycle=batch_size)
+        # compute_chromatograms_in_batches(wdir, use_for_optimization=True, batch_size=batch_size,
+        #                                     set_progress=progress_adapter, recompute_ms1=recompute_ms1,
+        #                                     recompute_ms2=recompute_ms2, n_cpus=n_cpus, ram=ram)
         logger.info(f"Chromatograms computed in {time.perf_counter() - start:.2f} seconds")
         
         # Update RT values to max intensity time only for targets that had RT auto-adjusted

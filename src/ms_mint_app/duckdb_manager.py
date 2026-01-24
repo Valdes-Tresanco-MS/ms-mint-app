@@ -64,7 +64,7 @@ def get_effective_cpus(n_cpus: int, ram_gb: int) -> int:
     """
     if not n_cpus or not ram_gb:
         return n_cpus or 4  # Default to 4 if not specified
-    return min(n_cpus, ram_gb)
+    return min(n_cpus, ram_gb*2)
 
 
 # Required tables and their core columns for validation
@@ -1514,6 +1514,390 @@ def compute_chromatograms_in_batches(wdir: str,
     with duckdb_connection(wdir, n_cpus=n_cpus, ram=ram) as conn:
         conn.execute("DROP TABLE IF EXISTS ms_file_scans")
         conn.execute("DROP TABLE IF EXISTS pending_pairs")
+
+
+def compute_chromatograms_optimized(
+        wdir: str,
+        use_for_optimization: bool,
+        checkpoint_every: int = 10,
+        set_progress=None,
+        recompute_ms1: bool = False,
+        recompute_ms2: bool = False,
+        n_cpus=None,
+        ram=None,
+        use_bookmarked: bool = False,
+        # objetivo de “pares pendientes” por ciclo (define dinámicamente cuántos archivos entran)
+        pairs_per_cycle: int = 10_000,
+        # airbag por si cada archivo tiene pocos pares pendientes (p.ej. +1 target)
+        max_files_per_cycle: int = 50,
+):
+    """
+    Versión por “batch de archivos”: cada ciclo ejecuta 1 query que procesa *varios* ms_file_label a la vez
+    (y opcionalmente sub-batches de targets), para que DuckDB tenga suficiente volumen y use threads.
+
+    La query calcula pares pendientes *en el momento de ejecución* (anti-join contra chromatograms), así:
+      - nuevo archivo -> faltan muchos pares (todos los targets) para ese archivo
+      - nuevo target  -> falta ese target para muchos archivos
+    y lo resuelve eficientemente sin computar archivo-por-archivo.
+    """
+
+    logger.info(f"Computing chromatograms (batch-files). wDir: {wdir}")
+
+    # === Query: scan lookup ===
+    QUERY_CREATE_SCAN_LOOKUP = """
+                               CREATE TABLE IF NOT EXISTS ms_file_scans AS
+                               SELECT DISTINCT ms_file_label, scan_id, scan_time, 'ms1' AS ms_type
+                               FROM ms1_data
+                               UNION ALL
+                               SELECT DISTINCT ms_file_label, scan_id, scan_time, 'ms2' AS ms_type
+                               FROM ms2_data
+                               ORDER BY ms_file_label, scan_id, ms_type;
+
+                               CREATE INDEX IF NOT EXISTS idx_ms_file_scans_file_scan
+                                   ON ms_file_scans (ms_file_label, scan_id, ms_type); \
+                               """
+
+    # === Batch query MS1: procesa varios archivos a la vez; calcula pares pendientes dentro del SQL ===
+    # Params: [file_labels_list, peak_labels_list, use_bookmarked]
+    QUERY_PROCESS_FILES_MS1 = """
+                              INSERT INTO chromatograms (peak_label, ms_file_label, scan_time, intensity, ms_type)
+                              WITH file_batch AS (SELECT UNNEST(?) ::VARCHAR AS ms_file_label),
+                                   target_filter AS (SELECT peak_label, mz_mean, mz_width, rt_min, rt_max
+                                                     FROM targets t
+                                                     WHERE t.ms_type = 'ms1'
+                                                       AND t.peak_label = ANY(?)
+                                                       AND (t.peak_selection IS TRUE OR NOT EXISTS (SELECT 1
+                                                                                                    FROM targets t1
+                                                                                                    WHERE t1.peak_selection IS TRUE
+                                                                                                      AND t1.ms_type = 'ms1'))
+                                                       AND (CASE WHEN ? THEN t.bookmark IS TRUE ELSE TRUE END)),
+                                   pending_pairs AS (SELECT fb.ms_file_label,
+                                                            tf.peak_label,
+                                                            tf.mz_mean,
+                                                            tf.mz_width,
+                                                            tf.rt_min,
+                                                            tf.rt_max
+                                                     FROM file_batch fb
+                                                              CROSS JOIN target_filter tf
+                                                     WHERE NOT EXISTS (SELECT 1
+                                                                       FROM chromatograms c
+                                                                       WHERE c.ms_type = 'ms1'
+                                                                         AND c.ms_file_label = fb.ms_file_label
+                                                                         AND c.peak_label = tf.peak_label)),
+                                   file_scans AS (SELECT s.ms_file_label, s.scan_id, s.scan_time
+                                                  FROM ms_file_scans s
+                                                           JOIN file_batch fb USING (ms_file_label)
+                                                  WHERE s.ms_type = 'ms1'),
+                                   matched_intensities AS (SELECT pp.peak_label,
+                                                                  pp.ms_file_label,
+                                                                  ms1.scan_id,
+                                                                  MAX(ms1.intensity) AS intensity
+                                                           FROM pending_pairs pp
+                                                                    JOIN ms1_data ms1
+                                                                         ON ms1.ms_file_label = pp.ms_file_label
+                                                                             AND
+                                                                            ms1.mz BETWEEN pp.mz_mean - (pp.mz_mean * pp.mz_width / 1e6)
+                                                                                AND pp.mz_mean + (pp.mz_mean * pp.mz_width / 1e6)
+                                                           GROUP BY pp.peak_label, pp.ms_file_label, ms1.scan_id),
+                                   scans_in_window AS (SELECT pp.peak_label,
+                                                              pp.ms_file_label,
+                                                              fs.scan_id,
+                                                              fs.scan_time
+                                                       FROM pending_pairs pp
+                                                                JOIN file_scans fs
+                                                                     ON fs.ms_file_label = pp.ms_file_label
+                                                                         AND
+                                                                        fs.scan_time BETWEEN COALESCE(pp.rt_min, 0) - 30
+                                                                            AND COALESCE(pp.rt_max, 999999) + 30),
+                                   complete_data AS (SELECT sw.peak_label,
+                                                            sw.ms_file_label,
+                                                            sw.scan_time,
+                                                            COALESCE(ROUND(mi.intensity, 0), 1) AS intensity
+                                                     FROM scans_in_window sw
+                                                              LEFT JOIN matched_intensities mi
+                                                                        ON sw.peak_label = mi.peak_label
+                                                                            AND sw.ms_file_label = mi.ms_file_label
+                                                                            AND sw.scan_id = mi.scan_id)
+                              SELECT peak_label,
+                                     ms_file_label,
+                                     LIST(scan_time ORDER BY scan_time) AS scan_time,
+                                     LIST(intensity ORDER BY scan_time) AS intensity,
+                                     'ms1'                              AS ms_type
+                              FROM complete_data
+                              GROUP BY peak_label, ms_file_label; \
+                              """
+
+    # === Batch query MS2: idem ===
+    # Params: [file_labels_list, peak_labels_list, use_bookmarked]
+    QUERY_PROCESS_FILES_MS2 = """
+                              INSERT INTO chromatograms (peak_label, ms_file_label, scan_time, intensity, ms_type)
+                              WITH file_batch AS (SELECT UNNEST(?) ::VARCHAR AS ms_file_label),
+                                   target_filter AS (SELECT peak_label, filterLine, rt_min, rt_max
+                                                     FROM targets t
+                                                     WHERE t.ms_type = 'ms2'
+                                                       AND t.peak_label = ANY(?)
+                                                       AND (t.peak_selection IS TRUE OR NOT EXISTS (SELECT 1
+                                                                                                    FROM targets t1
+                                                                                                    WHERE t1.peak_selection IS TRUE
+                                                                                                      AND t1.ms_type = 'ms2'))
+                                                       AND (CASE WHEN ? THEN t.bookmark IS TRUE ELSE TRUE END)),
+                                   pending_pairs AS (SELECT fb.ms_file_label,
+                                                            tf.peak_label,
+                                                            tf.filterLine,
+                                                            tf.rt_min,
+                                                            tf.rt_max
+                                                     FROM file_batch fb
+                                                              CROSS JOIN target_filter tf
+                                                     WHERE NOT EXISTS (SELECT 1
+                                                                       FROM chromatograms c
+                                                                       WHERE c.ms_type = 'ms2'
+                                                                         AND c.ms_file_label = fb.ms_file_label
+                                                                         AND c.peak_label = tf.peak_label)),
+                                   file_scans AS (SELECT s.ms_file_label, s.scan_id, s.scan_time
+                                                  FROM ms_file_scans s
+                                                           JOIN file_batch fb USING (ms_file_label)
+                                                  WHERE s.ms_type = 'ms2'),
+                                   matched_intensities AS (SELECT pp.peak_label,
+                                                                  pp.ms_file_label,
+                                                                  ms2.scan_id,
+                                                                  ms2.intensity
+                                                           FROM pending_pairs pp
+                                                                    JOIN ms2_data ms2
+                                                                         ON ms2.ms_file_label = pp.ms_file_label
+                                                                             AND ms2.filterLine = pp.filterLine),
+                                   scans_in_window AS (SELECT pp.peak_label,
+                                                              pp.ms_file_label,
+                                                              fs.scan_id,
+                                                              fs.scan_time
+                                                       FROM pending_pairs pp
+                                                                JOIN file_scans fs
+                                                                     ON fs.ms_file_label = pp.ms_file_label
+                                                                         AND
+                                                                        fs.scan_time BETWEEN COALESCE(pp.rt_min, 0) - 30
+                                                                            AND COALESCE(pp.rt_max, 999999) + 30),
+                                   complete_data AS (SELECT sw.peak_label,
+                                                            sw.ms_file_label,
+                                                            sw.scan_time,
+                                                            COALESCE(ROUND(mi.intensity, 0), 1) AS intensity
+                                                     FROM scans_in_window sw
+                                                              LEFT JOIN matched_intensities mi
+                                                                        ON sw.peak_label = mi.peak_label
+                                                                            AND sw.ms_file_label = mi.ms_file_label
+                                                                            AND sw.scan_id = mi.scan_id)
+                              SELECT peak_label,
+                                     ms_file_label,
+                                     LIST(scan_time ORDER BY scan_time) AS scan_time,
+                                     LIST(intensity ORDER BY scan_time) AS intensity,
+                                     'ms2'                              AS ms_type
+                              FROM complete_data
+                              GROUP BY peak_label, ms_file_label; \
+                              """
+
+    # === Pending work (para armar ciclos por pares pendientes) ===
+    QUERY_GET_PENDING = """
+                        WITH target_filter AS (SELECT peak_label, ms_type
+                                               FROM targets t
+                                               WHERE (t.peak_selection IS TRUE OR NOT EXISTS (SELECT 1
+                                                                                              FROM targets t1
+                                                                                              WHERE t1.peak_selection IS TRUE
+                                                                                                AND t1.ms_type = t.ms_type))
+                                                 AND (CASE WHEN ? THEN t.bookmark IS TRUE ELSE TRUE END)),
+                             sample_filter AS (SELECT ms_file_label
+                                               FROM samples
+                                               WHERE (CASE WHEN ? THEN use_for_optimization ELSE use_for_processing END) = TRUE),
+                             existing_pairs AS (SELECT DISTINCT peak_label, ms_file_label, ms_type
+                                                FROM chromatograms)
+                        SELECT ms_type,
+                               ms_file_label,
+                               LIST(peak_label) AS peak_labels,
+                               COUNT(*)         AS pair_count
+                        FROM (SELECT t.peak_label, s.ms_file_label, t.ms_type
+                              FROM target_filter t
+                                       CROSS JOIN sample_filter s
+                              WHERE NOT EXISTS (SELECT 1
+                                                FROM existing_pairs e
+                                                WHERE e.peak_label = t.peak_label
+                                                  AND e.ms_file_label = s.ms_file_label
+                                                  AND e.ms_type = t.ms_type))
+                        GROUP BY ms_type, ms_file_label
+                        ORDER BY ms_type, ms_file_label; \
+                        """
+
+    # === Cleanup inicial ===
+    if recompute_ms1:
+        logger.info("Deleting existing MS1 chromatograms...")
+        with duckdb_connection(wdir, n_cpus=n_cpus, ram=ram) as con:
+            con.execute("DELETE FROM chromatograms WHERE ms_type = 'ms1'")
+            con.execute("CHECKPOINT")
+
+    if recompute_ms2:
+        logger.info("Deleting existing MS2 chromatograms...")
+        with duckdb_connection(wdir, n_cpus=n_cpus, ram=ram) as con:
+            con.execute("DELETE FROM chromatograms WHERE ms_type = 'ms2'")
+            con.execute("CHECKPOINT")
+
+    # === Crear scan lookup ===
+    with duckdb_connection(wdir, n_cpus=n_cpus, ram=ram) as conn:
+        conn.execute("CHECKPOINT")
+        try:
+            _ = conn.execute("SELECT 1 FROM ms_file_scans LIMIT 1").fetchone()
+        except Exception:
+            logger.info("Creating scan lookup table...")
+            t0 = time.perf_counter()
+            conn.execute(QUERY_CREATE_SCAN_LOOKUP)
+            conn.execute("CHECKPOINT")
+            logger.info(f"Scan lookup created in {time.perf_counter() - t0:.2f}s")
+
+    # Limitar targets por sub-batch (para evitar explosión de intermedios cuando el batch de files es grande)
+    max_targets_per_batch = recommend_max_targets(available_ram_gb=ram, safety_factor=0.95)
+
+    # === Obtener pending ===
+    with duckdb_connection(wdir, n_cpus=n_cpus, ram=ram) as conn:
+        logger.info("Getting pending work...")
+        pending = conn.execute(QUERY_GET_PENDING, [use_bookmarked, use_for_optimization]).fetchall()
+
+    if not pending:
+        logger.info("No pending work")
+        return {'total_pairs': 0, 'processed': 0, 'failed': 0, 'batches': 0}
+
+    total_pairs = sum(row[3] for row in pending)
+    total_files = len(pending)
+    logger.info(f"{total_pairs:,} pending pairs across {total_files} file-type combinations")
+
+    def _take_cycle(pending_rows, start_i):
+        """Selecciona un ciclo sin mezclar ms_type, hasta alcanzar pairs_per_cycle o max_files_per_cycle."""
+        ms_type0 = pending_rows[start_i][0]
+        files = []
+        peaks = set()
+        pairs = 0
+        i = start_i
+
+        while i < len(pending_rows):
+            ms_type, ms_file_label, peak_labels_list, pair_count = pending_rows[i]
+            if ms_type != ms_type0:
+                break
+
+            files.append(ms_file_label)
+            peaks.update(peak_labels_list)
+            pairs += pair_count
+            i += 1
+
+            if pairs >= pairs_per_cycle or len(files) >= max_files_per_cycle:
+                break
+
+        return ms_type0, files, list(peaks), pairs, i
+
+    processed_est = 0
+    failed = 0
+    cycles = 0
+    cycles_since_checkpoint = 0
+
+    # === Ejecutar (1 conexión) ===
+    with duckdb_connection(wdir, n_cpus=n_cpus, ram=ram) as conn:
+        conn.execute("CHECKPOINT")
+        conn.execute("BEGIN TRANSACTION")
+
+        i = 0
+        cycle_id = 1
+
+        while i < len(pending):
+            ms_type, file_batch, peak_batch, cycle_pairs, next_i = _take_cycle(pending, i)
+
+            # Sub-batching de targets si el set es grande (sigue siendo 1 query por sub-batch, no por archivo)
+            peak_batch = list(peak_batch)
+            num_target_sub = (len(peak_batch) + max_targets_per_batch - 1) // max_targets_per_batch
+
+            logger.info(
+                f"Cycle {cycle_id}: {ms_type.upper()} | "
+                f"{len(file_batch)} files | ~{cycle_pairs:,} pending pairs | "
+                f"{len(peak_batch)} targets | target_sub_batches={num_target_sub}"
+            )
+
+            t_cycle = time.time()
+            for sb in range(num_target_sub):
+                t0 = sb * max_targets_per_batch
+                t1 = min(t0 + max_targets_per_batch, len(peak_batch))
+                sb_peaks = peak_batch[t0:t1]
+
+                t_sb = time.time()
+                if ms_type == "ms1":
+                    conn.execute(QUERY_PROCESS_FILES_MS1, [file_batch, sb_peaks, use_bookmarked])
+                else:
+                    conn.execute(QUERY_PROCESS_FILES_MS2, [file_batch, sb_peaks, use_bookmarked])
+                sb_dt = time.time() - t_sb
+
+                logger.info(
+                    f"  - Target sub-batch {sb + 1}/{num_target_sub}: {len(sb_peaks)} targets | {sb_dt:.2f}s"
+                )
+
+            cycle_dt = time.time() - t_cycle
+
+            # progreso estimado con snapshot de pending (en la práctica coincide salvo cambios concurrentes)
+            processed_est += cycle_pairs
+            cycles += 1
+            cycles_since_checkpoint += 1
+
+            logger.info(
+                f"Cycle {cycle_id} done in {cycle_dt:.2f}s | "
+                f"Progress(est): {processed_est:,}/{total_pairs:,} ({100 * processed_est / total_pairs:.1f}%)"
+            )
+
+            if set_progress:
+                progress_pct = (processed_est / total_pairs) * 100
+                _send_progress(
+                    set_progress,
+                    round(progress_pct, 1),
+                    stage="Chromatograms",
+                    detail=f"{ms_type.upper()} | {processed_est:,}/{total_pairs:,} pairs"
+                )
+
+            # checkpoint/commit por ciclos (igual idea que antes, pero ahora “batch” = ciclo)
+            if checkpoint_every and cycles_since_checkpoint >= checkpoint_every:
+                conn.execute("COMMIT")
+                conn.execute("CHECKPOINT")
+                conn.execute("BEGIN TRANSACTION")
+                cycles_since_checkpoint = 0
+
+            i = next_i
+            cycle_id += 1
+
+        conn.execute("COMMIT")
+        conn.execute("CHECKPOINT")
+
+    logger.info(f"Complete: ~{processed_est:,} processed(est), {failed:,} failed, {cycles} cycles")
+
+    return {
+        'total_pairs': total_pairs,
+        'processed': processed_est,  # estimado (basado en pending snapshot)
+        'failed': failed,
+        'batches': cycles
+    }
+
+
+
+def recommend_max_targets(available_ram_gb: int,
+                          avg_scans_per_file: int = 500,
+                          safety_factor: float = 0.5) -> int:
+    """
+    Recomienda max_targets_per_batch basado en RAM disponible.
+
+    Args:
+        available_ram_gb: RAM disponible en GB
+        avg_scans_per_file: Promedio de scans por archivo
+        safety_factor: Factor de seguridad (0.5 = usar solo 50% de RAM)
+
+    Returns:
+        Número recomendado de targets por batch
+    """
+    available_ram_mb = available_ram_gb * 1024 * safety_factor
+
+    # RAM por target ≈ scans × 30 bytes
+    ram_per_target_mb = (avg_scans_per_file * 30) / (1024 * 1024)
+
+    max_targets = int(available_ram_mb / ram_per_target_mb)
+
+    # Mínimo 10, máximo 200
+    return max(10, min(10000, max_targets))
 
 
 def compute_results_in_batches(wdir: str,
