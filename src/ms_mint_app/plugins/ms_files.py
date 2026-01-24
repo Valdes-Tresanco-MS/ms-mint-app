@@ -18,7 +18,7 @@ from plotly import colors
 
 from .. import tools as T
 from ..colors import make_palette_hsv
-from ..duckdb_manager import duckdb_connection, build_where_and_params, build_order_by
+from ..duckdb_manager import duckdb_connection, build_where_and_params, build_order_by, compact_database
 from ..plugin_interface import PluginInterface
 from ..sample_metadata import GROUP_COLUMNS, GROUP_DESCRIPTIONS, GROUP_LABELS
 from ..logging_setup import activate_workspace_logging
@@ -131,10 +131,14 @@ _layout = html.Div(
                         fac.AntdTitle(
                             'MS-Files', level=4, style={'margin': '0'}
                         ),
-                        fac.AntdIcon(
-                            id='ms-files-tour-icon',
-                            icon='pi-info',
-                            style={"cursor": "pointer", 'paddingLeft': '10px'},
+                        fac.AntdTooltip(
+                            fac.AntdIcon(
+                                id='ms-files-tour-icon',
+                                icon='pi-info',
+                                style={"cursor": "pointer", 'paddingLeft': '10px'},
+                                **{'aria-label': 'Show tutorial'},
+                            ),
+                            title='Show tutorial'
                         ),
                         # Always visible: Load MS-Files button
                         fac.AntdTooltip(
@@ -766,6 +770,21 @@ def _save_switch_changes(recentlySwitchDataIndex, recentlySwitchStatus, recently
                      (recentlySwitchStatus, recentlySwitchRow['ms_file_label']))
         logger.info(f"Updated {recentlySwitchDataIndex} for {recentlySwitchRow['ms_file_label']}: {recentlySwitchStatus}")
 
+        # Enforce dependencies
+        if recentlySwitchDataIndex == 'use_for_analysis' and recentlySwitchStatus is True:
+            # Analysis = True => Processing must be True
+            conn.execute("UPDATE samples SET use_for_processing = TRUE WHERE ms_file_label = ?",
+                         (recentlySwitchRow['ms_file_label'],))
+            logger.info(f"Auto-enabled use_for_processing for {recentlySwitchRow['ms_file_label']}")
+
+        if recentlySwitchDataIndex == 'use_for_processing' and recentlySwitchStatus is False:
+             # Processing = False => Analysis must be False
+            conn.execute("UPDATE samples SET use_for_analysis = FALSE WHERE ms_file_label = ?",
+                         (recentlySwitchRow['ms_file_label'],))
+            logger.info(f"Auto-disabled use_for_analysis for {recentlySwitchRow['ms_file_label']}")
+
+    return {'action': 'reload', 'timestamp': time.time()}
+
 
 def _ms_files_table(section_context, processing_output, processed_action, pagination, filter_, sorter, filterOptions,
                    processing_type, wdir):
@@ -860,16 +879,28 @@ def _ms_files_table(section_context, processing_output, processed_action, pagina
                 skip_nulls=False,
             ).alias('color'),
             pl.col('use_for_optimization').map_elements(
-                lambda value: {'checked': value},
-                return_dtype=pl.Struct({'checked': pl.Boolean})
+                lambda value: {'checked': value, 'checkedChildren': 'YES', 'unCheckedChildren': 'NO'},
+                return_dtype=pl.Struct({
+                    'checked': pl.Boolean,
+                    'checkedChildren': pl.String,
+                    'unCheckedChildren': pl.String
+                })
             ).alias('use_for_optimization'),
             pl.col('use_for_processing').map_elements(
-                lambda value: {'checked': value},
-                return_dtype=pl.Struct({'checked': pl.Boolean})
+                lambda value: {'checked': value, 'checkedChildren': 'YES', 'unCheckedChildren': 'NO'},
+                return_dtype=pl.Struct({
+                    'checked': pl.Boolean,
+                    'checkedChildren': pl.String,
+                    'unCheckedChildren': pl.String
+                })
             ).alias('use_for_processing'),
             pl.col('use_for_analysis').map_elements(
-                lambda value: {'checked': value},
-                return_dtype=pl.Struct({'checked': pl.Boolean})
+                lambda value: {'checked': value, 'checkedChildren': 'YES', 'unCheckedChildren': 'NO'},
+                return_dtype=pl.Struct({
+                    'checked': pl.Boolean,
+                    'checkedChildren': pl.String,
+                    'unCheckedChildren': pl.String
+                })
             ).alias('use_for_analysis'),
             pl.col('ms_type').map_elements(
                 lambda value: value.upper() if isinstance(value, str) else value,
@@ -891,7 +922,7 @@ def _ms_files_table(section_context, processing_output, processed_action, pagina
     return dash.no_update
 
 
-def _confirm_and_delete(okCounts, selectedRows, clickedKey, wdir):
+def _confirm_and_delete(okCounts, selectedRows, clickedKey, wdir, workspace_status):
     if okCounts is None:
         raise PreventUpdate
     if not wdir:
@@ -959,10 +990,28 @@ def _confirm_and_delete(okCounts, selectedRows, clickedKey, wdir):
                 conn.execute("ANALYZE")
 
                 ms_table_action_store = {'action': 'delete', 'status': 'success'}
+        
+        # Compact database only when clearing the entire table (outside 'with' block)
+        if ms_table_action_store.get('status') == 'success':
+            compact_success, compact_msg = compact_database(wdir)
+            if compact_success:
+                logger.info(f"Database compacted after clearing MS files: {compact_msg}")
+            else:
+                logger.warning(f"Failed to compact database: {compact_msg}")
     
     if total_removed > 0:
         logger.info(f"Deleted {total_removed} MS-Files.")
     
+    # Get updated file count for workspace-status
+    updated_count = 0
+    with duckdb_connection(wdir) as conn:
+        if conn is not None:
+            result = conn.execute("SELECT COUNT(*) FROM samples").fetchone()
+            updated_count = result[0] if result else 0
+
+    new_status = workspace_status or {}
+    new_status['ms_files_count'] = updated_count
+
     return (fac.AntdNotification(message="MS files deleted" if total_removed > 0 else "Failed to delete MS files",
                                  description=f"Deleted {total_removed} files",
                                  type="success" if total_removed > 0 else "error",
@@ -973,7 +1022,8 @@ def _confirm_and_delete(okCounts, selectedRows, clickedKey, wdir):
                                  style=NOTIFICATION_COMPACT_STYLE
                                  ),
             ms_table_action_store,
-            dash.no_update)
+            dash.no_update,
+            new_status)
 
 
 def _save_table_on_edit(row_edited, column_edited, wdir):
@@ -1212,6 +1262,7 @@ def callbacks(cls, app, fsc, cache, args_namespace):
         return _genere_color_map(nClicks, clickedKey, wdir)
 
     @app.callback(
+        Output('ms-table-action-store', 'data', allow_duplicate=True),
         Input('ms-files-table', 'recentlySwitchDataIndex'),
         Input('ms-files-table', 'recentlySwitchStatus'),
         Input('ms-files-table', 'recentlySwitchRow'),
@@ -1356,11 +1407,13 @@ def callbacks(cls, app, fsc, cache, args_namespace):
         Output("notifications-container", "children", allow_duplicate=True),
         Output("ms-table-action-store", "data", allow_duplicate=True),
         Output("ms-files-table-spin", "spinning"),
+        Output("workspace-status", "data", allow_duplicate=True),
 
         Input("delete-confirmation-modal", "okCounts"),
         State('ms-files-table', 'selectedRows'),
         State("ms-options", "clickedKey"),
         State("wdir", "data"),
+        State("workspace-status", "data"),
         background=True,
         running=[
             (Output("ms-files-table-spin", "spinning"), True, False),
@@ -1368,8 +1421,8 @@ def callbacks(cls, app, fsc, cache, args_namespace):
         ],
         prevent_initial_call=True,
     )
-    def confirm_and_delete(okCounts, selectedRows, clickedKey, wdir):
-        return _confirm_and_delete(okCounts, selectedRows, clickedKey, wdir)
+    def confirm_and_delete(okCounts, selectedRows, clickedKey, wdir, workspace_status):
+        return _confirm_and_delete(okCounts, selectedRows, clickedKey, wdir, workspace_status)
 
     @app.callback(
         Output("notifications-container", "children", allow_duplicate=True),

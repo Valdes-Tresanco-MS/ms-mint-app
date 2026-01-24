@@ -1,6 +1,7 @@
 import importlib
 import logging
 import os
+import sys
 import tempfile
 import time
 from pathlib import Path
@@ -85,14 +86,20 @@ def _build_layout(*, plugins, file_explorer, initial_page_children=None, initial
 
             fac.AntdSider(
                 [
-                    fac.AntdButton(
-                        id='main-sidebar-collapse',
-                        type='text',
-                        icon=fac.AntdIcon(
-                            id='main-sidebar-collapse-icon',
-                            icon='antd-left',
-                            style={'fontSize': '14px'}, ),
-                        shape='default',
+                    html.Div(
+                        fac.AntdTooltip(
+                            fac.AntdButton(
+                                id='main-sidebar-collapse',
+                                type='text',
+                                icon=fac.AntdIcon(
+                                    id='main-sidebar-collapse-icon',
+                                    icon='antd-left',
+                                    style={'fontSize': '14px'}, ),
+                                shape='default',
+                                **{'aria-label': 'Collapse/Expand Sidebar'},
+                            ),
+                            title='Collapse/Expand Sidebar'
+                        ),
                         style={
                             'position': 'absolute',
                             'zIndex': 1,
@@ -100,17 +107,18 @@ def _build_layout(*, plugins, file_explorer, initial_page_children=None, initial
                             'right': -10,
                             'boxShadow': 'rgb(0 0 0 / 20%) 0px 4px 10px 0px',
                             'background': 'white',
+                            'borderRadius': '4px',
                         },
-
                     ),
                     fac.AntdFlex(
                         [
-                            fac.AntdFlex(
-                                [
-                                    html.Div(id='notifications-container'),
                                     fac.AntdFlex(
                                         [
-                                            fac.AntdAvatar(
+                                            html.Div(id='corruption-notifications-container'),
+                                            html.Div(id='notifications-container'),
+                                            fac.AntdFlex(
+                                                [
+                                                    fac.AntdAvatar(
                                                 id='logo',
                                                 mode='image',
                                                 shape='square',
@@ -265,8 +273,9 @@ def register_callbacks(app, cache, fsc, args, *, plugins, file_explorer):
     from dash import html
     from dash.exceptions import PreventUpdate
     from flask_login import current_user
+    import feffery_antd_components as fac
 
-    from .duckdb_manager import duckdb_connection_mint
+    from .duckdb_manager import duckdb_connection_mint, is_workspace_corrupted
 
     logging.info("Register callbacks")
     upload_root = os.getenv("MINT_DATA_DIR", tempfile.gettempdir())
@@ -325,6 +334,29 @@ def register_callbacks(app, cache, fsc, args, *, plugins, file_explorer):
                 ),
                 section_context,
             )
+
+    @app.callback(
+        Output('corruption-notifications-container', 'children'),
+
+        Input('section-context', 'data'),
+        Input('wdir', 'data'),
+        prevent_initial_call=True
+    )
+    def check_corruption_on_navigation(section_context, wdir):
+        """Show notification when navigating to a tab or when workspace changes if corrupted."""
+        if not wdir:
+            raise PreventUpdate
+        if is_workspace_corrupted(wdir):
+            return fac.AntdNotification(
+                message="⚠️ Database Corrupted",
+                description="This workspace's database is corrupted. Please go to Workspaces tab and delete this workspace, then restore from backup or recreate it.",
+                type="error",
+                duration=15,
+                placement='bottom',
+                showProgress=True,
+            )
+        raise PreventUpdate
+
 
     @app.callback(
         Output('logo', 'style'),
@@ -429,6 +461,9 @@ def create_app(**kwargs):
         initial_page_children=initial_page_children,
         initial_section_context=initial_section_context,
     )
+
+    if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
+        kwargs['assets_folder'] = os.path.join(sys._MEIPASS, 'ms_mint_app', 'assets')
 
     app = Dash(
         __name__,

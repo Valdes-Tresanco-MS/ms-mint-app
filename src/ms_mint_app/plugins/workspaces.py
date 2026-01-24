@@ -47,10 +47,14 @@ _layout = html.Div(
         fac.AntdFlex(
             [
                 fac.AntdTitle('Workspaces', level=4, style={'margin': '0'}),
-                fac.AntdIcon(
-                    id='workspace-tour-icon',
-                    icon='pi-info',
-                    style={"cursor": "pointer", 'paddingLeft': '10px'},
+                fac.AntdTooltip(
+                    fac.AntdIcon(
+                        id='workspace-tour-icon',
+                        icon='pi-info',
+                        style={"cursor": "pointer", 'paddingLeft': '10px'},
+                        **{'aria-label': 'Show tutorial'}
+                    ),
+                    title='Show tutorial'
                 )
             ],
             align='center'
@@ -62,7 +66,7 @@ _layout = html.Div(
                 fac.AntdText("Current Data Directory:", strong=True),
                 fac.AntdTooltip(
                     title="This is the global root directory where all your workspaces and data are stored.",
-                    children=fac.AntdIcon(icon="antd-question-circle", style={"color": "#888", "marginRight": "2.5px"})
+                    children=fac.AntdIcon(icon="antd-question-circle", style={"color": "#555", "marginRight": "2.5px"})
                 ),
                 fac.AntdText("Loading...", id="ws-current-data-dir-text", style={"marginRight": "10px", "fontWeight": "bold"}),
                 fac.AntdTooltip(
@@ -219,7 +223,7 @@ _layout = html.Div(
                             )
                         ),
                         fac.AntdTooltip(
-                            fac.AntdIcon(icon='antd-question-circle', style={'color': '#999', 'fontSize': '16px'}),
+                            fac.AntdIcon(icon='antd-question-circle', style={'color': '#555', 'fontSize': '16px'}),
                             title='Enter the path to an existing MINT database file (.db) or click the folder icon to browse. This will copy the database and create a new workspace.'
                         ),
                     ],
@@ -786,63 +790,89 @@ def callbacks(app, fsc, cache):
                     style={'minWidth': '200px', 'flexGrow': 1, 'padding': '10px'}
                 )
 
-                # Avoid bumping last_activity just for rendering the preview table
-                with duckdb_connection(_path, register_activity=False) as conn:
-                    if conn is None:
-                        # Database is locked - return placeholder
+                try:
+                    # Avoid bumping last_activity just for rendering the preview table
+                    with duckdb_connection(_path, register_activity=False) as conn:
+                        if conn is None:
+                            # Database is locked - return placeholder
+                            return fac.AntdFlex(
+                                [
+                                    path_info,
+                                    fac.AntdText("Database busy...", type='secondary')
+                                ],
+                                wrap=True
+                            )
+                        summary = conn.execute("""
+                                               SELECT * FROM (
+                                                   SELECT 'samples' AS table_name, COUNT(*) AS rows FROM samples
+                                                   UNION ALL
+                                                   SELECT 'ms1_data' AS table_name, COUNT(*) AS rows FROM ms1_data
+                                                   UNION ALL
+                                                   SELECT 'ms2_data' AS table_name, COUNT(*) AS rows FROM ms2_data
+                                                   UNION ALL
+                                                   SELECT 'targets' AS table_name, COUNT(*) AS rows FROM targets
+                                                   UNION ALL
+                                                   SELECT 'chromatograms' AS table_name, COUNT(*) AS rows FROM chromatograms
+                                                   UNION ALL
+                                                   SELECT 'results' AS table_name, COUNT(*) AS rows FROM results
+                                               ) t
+                                               ORDER BY CASE table_name
+                                                            WHEN 'samples' THEN 1
+                                                            WHEN 'ms1_data' THEN 2
+                                                            WHEN 'ms2_data' THEN 3
+                                                            WHEN 'targets' THEN 4
+                                                            WHEN 'chromatograms' THEN 5
+                                                            WHEN 'results' THEN 6
+                                                            ELSE 7
+                                                            END
+                                               """).df()
+                        if not summary.empty:
+                            summary['rows'] = summary['rows'].apply(
+                                lambda x: f"{int(x):,}" if pd.notna(x) else ""
+                            )
+                        db_info = fac.AntdTable(
+                            columns=[
+                                {'title': 'Table name', 'dataIndex': 'table_name', 'align': 'left', 'width': '50%'},
+                                {'title': 'Rows', 'dataIndex': 'rows', 'align': 'center', 'width': '50%'},
+                            ],
+                            data=summary.to_dict('records'),
+                            pagination=False,
+                            locale='en-us',
+                            size='small',
+                            style={'minWidth': '200px', 'flexGrow': 1}
+                        )
+                    return fac.AntdFlex(
+                        [
+                            path_info,
+                            db_info
+                        ],
+                        wrap=True
+                    )
+                except Exception as e:
+                    # Check for database corruption
+                    from ..duckdb_manager import DatabaseCorruptionError
+                    if isinstance(e, DatabaseCorruptionError) or "Corrupt database file" in str(e):
                         return fac.AntdFlex(
                             [
                                 path_info,
-                                fac.AntdText("Database busy...", type='secondary')
+                                fac.AntdAlert(
+                                    message="⚠️ Database Corrupted",
+                                    description="This workspace's database is corrupted. Please delete this workspace and restore from backup or recreate it.",
+                                    type='error',
+                                    showIcon=True,
+                                    style={'maxWidth': '400px'}
+                                )
                             ],
                             wrap=True
                         )
-                    summary = conn.execute("""
-                                           SELECT * FROM (
-                                               SELECT 'samples' AS table_name, COUNT(*) AS rows FROM samples
-                                               UNION ALL
-                                               SELECT 'ms1_data' AS table_name, COUNT(*) AS rows FROM ms1_data
-                                               UNION ALL
-                                               SELECT 'ms2_data' AS table_name, COUNT(*) AS rows FROM ms2_data
-                                               UNION ALL
-                                               SELECT 'targets' AS table_name, COUNT(*) AS rows FROM targets
-                                               UNION ALL
-                                               SELECT 'chromatograms' AS table_name, COUNT(*) AS rows FROM chromatograms
-                                               UNION ALL
-                                               SELECT 'results' AS table_name, COUNT(*) AS rows FROM results
-                                           ) t
-                                           ORDER BY CASE table_name
-                                                        WHEN 'samples' THEN 1
-                                                        WHEN 'ms1_data' THEN 2
-                                                        WHEN 'ms2_data' THEN 3
-                                                        WHEN 'targets' THEN 4
-                                                        WHEN 'chromatograms' THEN 5
-                                                        WHEN 'results' THEN 6
-                                                        ELSE 7
-                                                        END
-                                           """).df()
-                    if not summary.empty:
-                        summary['rows'] = summary['rows'].apply(
-                            lambda x: f"{int(x):,}" if pd.notna(x) else ""
-                        )
-                    db_info = fac.AntdTable(
-                        columns=[
-                            {'title': 'Table name', 'dataIndex': 'table_name', 'align': 'left', 'width': '50%'},
-                            {'title': 'Rows', 'dataIndex': 'rows', 'align': 'center', 'width': '50%'},
+                    # Other errors - show generic message
+                    return fac.AntdFlex(
+                        [
+                            path_info,
+                            fac.AntdText(f"Error loading workspace: {str(e)[:50]}", type='danger')
                         ],
-                        data=summary.to_dict('records'),
-                        pagination=False,
-                        locale='en-us',
-                        size='small',
-                        style={'minWidth': '200px', 'flexGrow': 1}
+                        wrap=True
                     )
-                return fac.AntdFlex(
-                    [
-                        path_info,
-                        db_info
-                    ],
-                    wrap=True
-                )
 
             row_content['content'] = row_content['key'].apply(row_comp)
             selectedRowKeys = mint_conn.execute("SELECT key FROM workspaces WHERE active = true").fetchone()
@@ -884,41 +914,56 @@ def callbacks(app, fsc, cache):
         }
         
         if wdir_path:
-            from ..duckdb_manager import duckdb_connection
-            with duckdb_connection(wdir_path) as conn:
-                if conn is not None:
-                    counts = conn.execute("""
-                        SELECT 
-                            (SELECT COUNT(*) FROM samples) as ms_files,
-                            (SELECT COUNT(*) FROM targets) as targets,
-                            (SELECT COUNT(*) FROM chromatograms) as chroms,
-                            (SELECT COUNT(*) FROM chromatograms WHERE ms_type = 'ms1') as chroms_ms1,
-                            (SELECT COUNT(*) FROM chromatograms WHERE ms_type = 'ms2') as chroms_ms2,
-                            (SELECT COUNT(*) FROM targets WHERE peak_selection = TRUE) as selected_targets,
-                            (SELECT COUNT(*) FROM samples WHERE use_for_optimization = TRUE) as opt_samples,
-                            (SELECT COUNT(*) FROM results) as results
-                    """).fetchone()
-                    if counts:
-                        n_cpus = cpu_count()
-                        default_cpus = max(1, n_cpus // 2)
-                        ram_avail = psutil.virtual_memory().available / (1024 ** 3)
-                        default_ram = round(min(float(default_cpus), ram_avail), 1)
+            from ..duckdb_manager import duckdb_connection, DatabaseCorruptionError
+            try:
+                with duckdb_connection(wdir_path) as conn:
+                    if conn is not None:
+                        counts = conn.execute("""
+                            SELECT 
+                                (SELECT COUNT(*) FROM samples) as ms_files,
+                                (SELECT COUNT(*) FROM targets) as targets,
+                                (SELECT COUNT(*) FROM chromatograms) as chroms,
+                                (SELECT COUNT(*) FROM chromatograms WHERE ms_type = 'ms1') as chroms_ms1,
+                                (SELECT COUNT(*) FROM chromatograms WHERE ms_type = 'ms2') as chroms_ms2,
+                                (SELECT COUNT(*) FROM targets WHERE peak_selection = TRUE) as selected_targets,
+                                (SELECT COUNT(*) FROM samples WHERE use_for_optimization = TRUE) as opt_samples,
+                                (SELECT COUNT(*) FROM results) as results
+                        """).fetchone()
+                        if counts:
+                            n_cpus = cpu_count()
+                            default_cpus = max(1, n_cpus // 2)
+                            ram_avail = psutil.virtual_memory().available / (1024 ** 3)
+                            default_ram = round(min(float(default_cpus), ram_avail), 1)
 
-                        workspace_status = {
-                            'ms_files_count': counts[0] or 0,
-                            'targets_count': counts[1] or 0,
-                            'chromatograms_count': counts[2] or 0,
-                            'chroms_ms1_count': counts[3] or 0,
-                            'chroms_ms2_count': counts[4] or 0,
-                            'selected_targets_count': counts[5] or 0,
-                            'optimization_samples_count': counts[6] or 0,
-                            'results_count': counts[7] or 0,
-                            'n_cpus': n_cpus,
-                            'default_cpus': default_cpus,
-                            'ram_avail': round(ram_avail, 1),
-                            'default_ram': default_ram
-                        }
-                        logger.info(f"workspace-status populated: {workspace_status}")
+                            workspace_status = {
+                                'ms_files_count': counts[0] or 0,
+                                'targets_count': counts[1] or 0,
+                                'chromatograms_count': counts[2] or 0,
+                                'chroms_ms1_count': counts[3] or 0,
+                                'chroms_ms2_count': counts[4] or 0,
+                                'selected_targets_count': counts[5] or 0,
+                                'optimization_samples_count': counts[6] or 0,
+                                'results_count': counts[7] or 0,
+                                'n_cpus': n_cpus,
+                                'default_cpus': default_cpus,
+                                'ram_avail': round(ram_avail, 1),
+                                'default_ram': default_ram
+                            }
+                            logger.info(f"workspace-status populated: {workspace_status}")
+            except DatabaseCorruptionError as e:
+                logger.error(f"Database corruption detected during activation: {e}")
+                notification = fac.AntdNotification(
+                    message="⚠️ Database Corrupted",
+                    description="This workspace's database is corrupted. Please delete and restore from backup or recreate it.",
+                    type="error",
+                    duration=10,
+                    placement='bottom',
+                    showProgress=True,
+                )
+                # Mark status as corrupted
+                workspace_status['corrupted'] = True
+            except Exception as e:
+                logger.error(f"Error loading workspace status: {e}")
         
         return notification, ws_name, wdir_path, wdir_path2, workspace_status
 

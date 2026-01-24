@@ -13,7 +13,7 @@ from ms_mint_app.plugins.ms_files import (
     _confirm_and_delete,
     _save_table_on_edit,
     _save_switch_changes,
-    _set_color,
+    _save_color_to_db,
     _genere_color_map,
     generate_colors
 )
@@ -39,7 +39,9 @@ def temp_wdir(tmp_path):
     return str(wdir)
 
 class TestMSFilesTable:
-    def test_ms_files_table_basic(self, temp_wdir):
+    @patch('ms_mint_app.plugins.ms_files.dash.callback_context')
+    def test_ms_files_table_basic(self, mock_ctx, temp_wdir):
+        mock_ctx.triggered = []
         pagination = {'pageSize': 10, 'current': 1}
         filterOptions = {
             'sample_type': {}, 'polarity': {}, 'ms_type': {}, 'file_type': {},
@@ -54,7 +56,9 @@ class TestMSFilesTable:
         assert data[0]['color']['content'] == '#ff0000'
         assert data[1]['ms_file_label'] == 'file2'
 
-    def test_ms_files_table_filtering(self, temp_wdir):
+    @patch('ms_mint_app.plugins.ms_files.dash.callback_context')
+    def test_ms_files_table_filtering(self, mock_ctx, temp_wdir):
+        mock_ctx.triggered = []
         pagination = {'pageSize': 10, 'current': 1}
         filterOptions = {
             'sample_type': {}, 'polarity': {'filterMode': 'checkbox'}, 'ms_type': {}, 'file_type': {},
@@ -76,7 +80,7 @@ class TestMSFilesCRUD:
             
         notification = res[0]
         assert notification.type == 'success'
-        assert "Deleted 1 MS-Files" in notification.description
+        assert "Deleted 1 files" in notification.description
         
         from ms_mint_app.duckdb_manager import duckdb_connection
         with duckdb_connection(temp_wdir) as conn:
@@ -90,7 +94,7 @@ class TestMSFilesCRUD:
         with patch('ms_mint_app.plugins.ms_files.activate_workspace_logging'):
             res = _confirm_and_delete(1, [], 'delete-all', temp_wdir)
             
-        assert "Deleted 2 MS-Files" in res[0].description
+        assert "Deleted 2 files" in res[0].description
         from ms_mint_app.duckdb_manager import duckdb_connection
         with duckdb_connection(temp_wdir) as conn:
             count = conn.execute("SELECT COUNT(*) FROM samples").fetchone()[0]
@@ -120,9 +124,10 @@ class TestMSFilesCRUD:
 class TestMSFilesColors:
     def test_set_color_manual(self, temp_wdir):
         recentlyButtonClickedRow = {'ms_file_label': 'file1', 'color': {'content': '#ff0000'}}
-        res = _set_color(1, '#aabbcc', recentlyButtonClickedRow, [], temp_wdir)
+        # _save_color_to_db(okCounts, color, recentlyButtonClickedRow, wdir)
+        res = _save_color_to_db(1, '#aabbcc', recentlyButtonClickedRow, temp_wdir)
         
-        assert res[0].type == 'success'
+        assert res.type == 'success'
         from ms_mint_app.duckdb_manager import duckdb_connection
         with duckdb_connection(temp_wdir) as conn:
             color = conn.execute("SELECT color FROM samples WHERE ms_file_label = 'file1'").fetchone()[0]

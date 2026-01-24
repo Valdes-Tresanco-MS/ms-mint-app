@@ -89,25 +89,43 @@ class FileExplorer:
                                                                     'title': 'Name',
                                                                     'dataIndex': 'name',
                                                                     'align': 'left',
-                                                                    'width': '70%',
+                                                                    'width': '50%',
                                                                     'renderOptions': {'renderType': 'link'},
                                                                 },
                                                                 {
-                                                                    'title': 'T',
+                                                                    'title': 'Type',
                                                                     'dataIndex': 'type',
-                                                                    'width': '5%',
+                                                                    'width': '12.5%',
                                                                 },
                                                                 {
                                                                     'title': 'Modified',
                                                                     'dataIndex': 'modified',
-                                                                    'width': '25%',
+                                                                    'width': '30%',
                                                                 },
                                                                 {
-                                                                    'title': 'Fc',
+                                                                    'title': 'Files',
                                                                     'dataIndex': 'file_count',
-                                                                    'width': '10%',
+                                                                    'width': '12.5%',
                                                                 },
                                                             ],
+                                                            titlePopoverInfo={
+                                                                'name': {
+                                                                    'title': 'Name',
+                                                                    'content': 'The name of the file or directory.',
+                                                                },
+                                                                'type': {
+                                                                    'title': 'Type',
+                                                                    'content': 'The type of the item (File or Folder).',
+                                                                },
+                                                                'modified': {
+                                                                    'title': 'Modified',
+                                                                    'content': 'The timestamp of the last modification.',
+                                                                },
+                                                                'file_count': {
+                                                                    'title': 'Files',
+                                                                    'content': 'The number of matching files in the directory.',
+                                                                },
+                                                            },
                                                             sortOptions={
                                                                 'sortDataIndexes': ['modified', 'name', 'file_count']},
                                                             rowSelectionType='checkbox',
@@ -131,16 +149,41 @@ class FileExplorer:
                                                     style={
                                                         'maxWidth': '800px', 'height': '524px'}
                                                 ),
-                                                # Filter by extension
-                                                fac.AntdSelect(
-                                                    id='selected-files-extensions',
-                                                    size="small",
-                                                    mode="multiple",
-                                                    placeholder='Filter by extension',
+                                                fac.AntdFlex(
+                                                    [
+                                                        # CPUs configuration
+                                                        fac.AntdForm(
+                                                            [
+                                                                fac.AntdFormItem(
+                                                                    fac.AntdInputNumber(
+                                                                        id='processing-cpu-input',
+                                                                        defaultValue=max(1, psutil.cpu_count() // 2),
+                                                                        min=1,
+                                                                        max=psutil.cpu_count(),
+                                                                        size='small',
+                                                                    ),
+                                                                    label='CPUs:',
+                                                                    tooltip='Number of CPUs to use for processing in parallel',
+                                                                ),
+                                                            ],
+                                                            layout='inline',
+                                                            id='processing-cpu-form',
+                                                            style={'marginRight': '10px'}
+                                                        ),
+                                                        # Filter by extension
+                                                        fac.AntdSelect(
+                                                            id='selected-files-extensions',
+                                                            size="small",
+                                                            mode="multiple",
+                                                            placeholder='Filter by extension',
+                                                            style={'flex': '1'},
+                                                            locale="en-us",
+                                                            allowClear=True,
+                                                            disabled=True,
+                                                        ),
+                                                    ],
+                                                    align='center',
                                                     style={'width': "100%", 'margin': '10px 0'},
-                                                    locale="en-us",
-                                                    allowClear=True,
-                                                    disabled=True,
                                                 ),
                                             ],
                                         ),
@@ -151,20 +194,28 @@ class FileExplorer:
                                                         html.Strong("Selected files"),
                                                         fac.AntdSpace(
                                                             [
-                                                                fac.AntdButton(
-                                                                    id='remove-marked-btn',
-                                                                    size='small',
-                                                                    danger=True,
-                                                                    type='text',
-                                                                    icon=fac.AntdIcon(
-                                                                        icon='md-remove-circle-outline'),
+                                                                fac.AntdTooltip(
+                                                                    fac.AntdButton(
+                                                                        id='remove-marked-btn',
+                                                                        size='small',
+                                                                        danger=True,
+                                                                        type='text',
+                                                                        icon=fac.AntdIcon(
+                                                                            icon='md-remove-circle-outline'),
+                                                                        **{'aria-label': 'Remove selected files from list'},
+                                                                    ),
+                                                                    title='Remove selected files from list'
                                                                 ),
-                                                                fac.AntdButton(
-                                                                    id='clear-selection-btn',
-                                                                    size='small',
-                                                                    danger=True,
-                                                                    type='primary',
-                                                                    icon=fac.AntdIcon(icon='antd-delete'),
+                                                                fac.AntdTooltip(
+                                                                    fac.AntdButton(
+                                                                        id='clear-selection-btn',
+                                                                        size='small',
+                                                                        danger=True,
+                                                                        type='primary',
+                                                                        icon=fac.AntdIcon(icon='antd-delete'),
+                                                                        **{'aria-label': 'Clear all selected files'},
+                                                                    ),
+                                                                    title='Clear all selected files'
                                                                 ),
                                                             ],
                                                             size='small'
@@ -207,7 +258,7 @@ class FileExplorer:
                                                     'Total: 0 files selected',
                                                     id='selection-counter',
                                                     style={'marginTop': '10px', 'fontSize': '12px',
-                                                           'color': '#666'}
+                                                           'color': '#444'}
                                                 ),
                                             ],
                                             vertical=True,
@@ -215,25 +266,7 @@ class FileExplorer:
                                     ],
                                     align='start',
                                 ),
-                                # CPUs configuration
-                                fac.AntdForm(
-                                    [
-                                        fac.AntdFormItem(
-                                            fac.AntdInputNumber(
-                                                id='processing-cpu-input',
-                                                defaultValue=max(1, psutil.cpu_count() // 2),
-                                                min=1,
-                                                max=psutil.cpu_count(),
-                                                size='small',
-                                            ),
-                                            label='CPUs:',
-                                            tooltip='Number of CPUs to use for processing in parallel',
-                                        ),
-                                    ],
-                                    layout='inline',
-                                    id='processing-cpu-form',
-                                    style={'marginTop': '20px'}
-                                ),
+
                             ],
                             id='selection-container',
                         ),
@@ -302,13 +335,19 @@ class FileExplorer:
             for letter in string.ascii_uppercase:
                 drive = f"{letter}:\\"
                 if Path(drive).exists():
+                    try:
+                         # counting files can fail due to permissions
+                        count = len([f for ext in extensions for f in Path(drive).glob(f'*{ext}')])
+                    except Exception:
+                        count = '-'
+                    
                     table_data.append({
                         'key': drive,
                         'name': {
                             'content': f"{letter}:",
                         },
-                        'type': 'Unidad',
-                        'file_count': len([f for ext in extensions for f in Path(drive).glob(f'*{ext}')]) or '-',
+                        'type': fac.AntdIcon(icon='antd-database'),
+                        'file_count': count,
                         'path': drive,
                         'is_dir': True,
                     })
@@ -479,15 +518,16 @@ class FileExplorer:
 
             Input('selection-modal', 'visible'),
             Input('current-path-modal', 'clickedItem'),
-            Input('file-table', 'recentlyCellClickRecord'),
+            Input('file-table', 'nClicksCell'),
 
             State('current-path-store', 'data'),
             State('processing-type-store', 'data'),
+            State('file-table', 'recentlyCellClickRecord'),
 
             prevent_initial_call=True
         )
-        def navigate_folders(modal_visible, bc_clicked_item, recentlyCellClickRecord, current_path, processing_type):
-            return _navigate_folders(self, modal_visible, bc_clicked_item, recentlyCellClickRecord, current_path, processing_type)
+        def navigate_folders(modal_visible, bc_clicked_item, n_clicks_cell, current_path, processing_type, recentlyCellClickRecord):
+            return _navigate_folders(self, modal_visible, bc_clicked_item, n_clicks_cell, recentlyCellClickRecord, current_path, processing_type)
 
         @app.callback(
             Output('selected-files-store', 'data', allow_duplicate=True),
@@ -589,7 +629,7 @@ class FileExplorer:
             return progress_style, selection_style, False, False, {'disabled': False}
 
 
-def _navigate_folders(explorer_instance, modal_visible, bc_clicked_item, recentlyCellClickRecord, current_path, processing_type):
+def _navigate_folders(explorer_instance, modal_visible, bc_clicked_item, n_clicks_cell, recentlyCellClickRecord, current_path, processing_type):
     if not modal_visible:
         return dash.no_update, dash.no_update, dash.no_update, dash.no_update
 
@@ -600,10 +640,18 @@ def _navigate_folders(explorer_instance, modal_visible, bc_clicked_item, recentl
     else:
         # Fallback for testing or non-contextual calls
         trigger_id = 'selection-modal'
+    
+    WIN_ROOT_KEY = "::WIN_ROOT::"
+    show_drives = False
+    new_path = None
 
     # Determine the new path
     if 'current-path-modal' in trigger_id and bc_clicked_item:
-        new_path = Path(bc_clicked_item.get('itemKey', current_path))
+        key = bc_clicked_item.get('itemKey', current_path)
+        if key == WIN_ROOT_KEY:
+            show_drives = True
+        else:
+            new_path = Path(key)
     elif 'file-table' in trigger_id and recentlyCellClickRecord:
         # Navigate only if is a directory
         if recentlyCellClickRecord.get('is_dir'):
@@ -611,13 +659,27 @@ def _navigate_folders(explorer_instance, modal_visible, bc_clicked_item, recentl
         else:
             return dash.no_update, dash.no_update, dash.no_update, dash.no_update
     elif 'selection-modal' in trigger_id:
-        new_path = Path(current_path or home_path)
+        if current_path == WIN_ROOT_KEY:
+             show_drives = True
+        else:
+             new_path = Path(current_path or home_path)
     else:
         return dash.no_update, dash.no_update, dash.no_update, dash.no_update
 
-    # Construct breadcrumb
+    # Handle Drive Listing View
+    if show_drives:
+        breadcrumb_items = [{'title': 'My Computer', 'key': WIN_ROOT_KEY}]
+        extensions = processing_type.get('extensions', ['.csv'])
+        new_table_data = explorer_instance.get_table_data(None, extensions, is_root=True)
+        return breadcrumb_items, new_table_data, WIN_ROOT_KEY, new_table_data
+
+    # Regular Construction of breadcrumb
     try:
+        breadcrumb_items = []
+        # Add My Computer node for Windows
         if platform.system() == 'Windows':
+            breadcrumb_items.append({'title': 'My Computer', 'key': WIN_ROOT_KEY})
+            
             root = Path(new_path.drive + '\\')
             all_paths = [root] + [p for p in new_path.parents if p != root][::-1]
             if new_path != root:
@@ -627,13 +689,13 @@ def _navigate_folders(explorer_instance, modal_visible, bc_clicked_item, recentl
             if new_path != Path('/'):
                 all_paths.append(new_path)
 
-        breadcrumb_items = []
         for i, path in enumerate(all_paths):
-            if i == 0:
+            if i == 0 and platform.system() != 'Windows':
                 breadcrumb_items.append(
                     {'title': 'root' if str(path) == '/' else str(path), 'key': str(path)})
             else:
-                breadcrumb_items.append({'title': path.name, 'key': str(path)})
+                 breadcrumb_items.append({'title': path.name or str(path), 'key': str(path)})
+                 
     except Exception as e:
         logger.error(f"Error constructing breadcrumb for {new_path}: {e}")
         breadcrumb_items = [{'title': str(new_path), 'key': str(new_path)}]

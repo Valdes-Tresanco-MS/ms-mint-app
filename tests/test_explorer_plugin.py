@@ -134,7 +134,7 @@ class TestExplorerProcessing:
         
         notification = res[0]
         assert notification.type == 'success'
-        assert "Successfully processed 5 files" in notification.description
+        assert "Processed 5 items." in notification.description
         mock_process.assert_called_once()
 
     @patch('ms_mint_app.plugins.explorer.process_metadata')
@@ -145,17 +145,17 @@ class TestExplorerProcessing:
         
         res = _background_processing(None, 1, processing_type, selected_files, 4, None)
         assert res[0].type == 'success'
-        assert "Successfully processed 2 files" in res[0].description
+        assert "Processed 2 items." in res[0].description
 
     @patch('ms_mint_app.plugins.explorer.process_targets')
     def test_background_processing_targets_fail(self, mock_process, explorer):
-        mock_process.return_value = (0, ['bad.csv'], ['Row 1 failed'], {})
+        mock_process.return_value = (0, {'bad.csv': 'Error details'}, ['Row 1 failed'], {})
         processing_type = {'type': 'targets'}
         selected_files = ['/path/bad.csv']
         
         res = _background_processing(None, 1, processing_type, selected_files, 4, None)
         assert res[0].type == 'error'
-        assert "Failed processing 1 files" in res[0].description
+        assert "Failed to process 1 file(s)." in res[0].description
 
     def test_background_processing_no_selection(self, explorer):
         with pytest.raises(PreventUpdate):

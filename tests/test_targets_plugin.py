@@ -30,7 +30,9 @@ class TestTargetsTable:
         sorter = []
         filterOptions = {'category': {'filterCustomItems': []}}
         
-        result = _targets_table({'page': 'Targets'}, pagination, filter_, sorter, filterOptions, temp_wdir)
+        with patch('dash.callback_context') as mock_ctx:
+            mock_ctx.triggered = [{'prop_id': 'targets-table.pagination'}]
+            result = _targets_table({'page': 'Targets'}, pagination, filter_, sorter, filterOptions, temp_wdir)
         
         data, selected_keys, pagination_out, filter_out = result
         assert len(data) == 2
@@ -46,7 +48,9 @@ class TestTargetsTable:
         sorter = []
         filterOptions = {'peak_label': {'filterMode': 'keyword'}}
         
-        result = _targets_table({'page': 'Targets'}, pagination, filter_, sorter, filterOptions, temp_wdir)
+        with patch('dash.callback_context') as mock_ctx:
+            mock_ctx.triggered = [{'prop_id': 'targets-table.filter'}]
+            result = _targets_table({'page': 'Targets'}, pagination, filter_, sorter, filterOptions, temp_wdir)
         
         data, _, pagination_out, _ = result
         assert len(data) == 1
@@ -58,7 +62,9 @@ class TestTargetsTable:
         sorter = {'columns': ['mz_mean'], 'orders': ['descend']}
         filterOptions = {}
         
-        result = _targets_table({'page': 'Targets'}, pagination, filter_, sorter, filterOptions, temp_wdir)
+        with patch('dash.callback_context') as mock_ctx:
+            mock_ctx.triggered = [{'prop_id': 'targets-table.sorter'}]
+            result = _targets_table({'page': 'Targets'}, pagination, filter_, sorter, filterOptions, temp_wdir)
         
         data, _, _, _ = result
         assert data[0]['peak_label'] == 'Target2' # 200.0 > 100.0
@@ -117,7 +123,7 @@ class TestTargetsAsari:
         
         result = _run_asari_analysis(1, temp_wdir, 1, 5, 'pos', 20, 100000, 6, 0.9, 1, 90)
         
-        notification, visible, alert, action_store = result
+        notification, visible, alert, action_store, workspace_status = result
         assert visible is False
         assert 'timestamp' in action_store
         assert mock_run.called

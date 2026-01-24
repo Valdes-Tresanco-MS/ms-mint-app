@@ -11,7 +11,7 @@ from dash.dependencies import Input, Output, State
 from dash.exceptions import PreventUpdate
 
 from .. import tools as T
-from ..duckdb_manager import duckdb_connection, build_where_and_params, build_order_by
+from ..duckdb_manager import duckdb_connection, build_where_and_params, build_order_by, compact_database
 from ..plugin_interface import PluginInterface
 from ..logging_setup import activate_workspace_logging
 from . import targets_asari
@@ -44,7 +44,7 @@ TARGET_TEMPLATE_DESCRIPTIONS = [
     'True if selected for analysis',
     'True if bookmarked',
     'Mean m/z (centroid)',
-    'm/z window or tolerance',
+    'm/z window or tolerance (ppm)',
     'Precursor m/z (MS2)',
     'Retention time (default: in seconds)',
     'Lower RT bound (default: in seconds)',
@@ -90,10 +90,14 @@ _layout = html.Div(
                         fac.AntdTitle(
                             'Targets', level=4, style={'margin': '0'}
                         ),
-                        fac.AntdIcon(
-                            id='targets-tour-icon',
-                            icon='pi-info',
-                            style={"cursor": "pointer", 'paddingLeft': '10px'},
+                        fac.AntdTooltip(
+                            fac.AntdIcon(
+                                id='targets-tour-icon',
+                                icon='pi-info',
+                                style={"cursor": "pointer", 'paddingLeft': '10px'},
+                                **{'aria-label': 'Show tutorial'},
+                            ),
+                            title='Show tutorial'
                         ),
                         fac.AntdTooltip(
                             fac.AntdButton(
@@ -732,6 +736,8 @@ def _targets_table(section_context, pagination, filter_, sorter, filterOptions, 
         current = pagination['current']
 
         with duckdb_connection(wdir) as conn:
+            if conn is None:
+                raise PreventUpdate
             schema = conn.execute("DESCRIBE targets").pl()
         column_types = {r["column_name"]: r["column_type"] for r in schema.to_dicts()}
         where_sql, params = build_where_and_params(filter_, filterOptions)
@@ -757,6 +763,8 @@ def _targets_table(section_context, pagination, filter_, sorter, filterOptions, 
         params_paged = params + [page_size, (current - 1) * page_size]
 
         with duckdb_connection(wdir) as conn:
+            if conn is None:
+                raise PreventUpdate
             dfpl = conn.execute(sql, params_paged).pl()
 
         data = (
@@ -786,6 +794,8 @@ def _targets_table(section_context, pagination, filter_, sorter, filterOptions, 
         if len(data) == 0 and number_records == 0:
             # Check if there are actually any records matching the filter
             with duckdb_connection(wdir) as conn:
+                if conn is None:
+                    raise PreventUpdate
                 count_sql = f"SELECT COUNT(*) FROM targets {where_sql}"
                 total_count = conn.execute(count_sql, params).fetchone()[0]
                 if total_count > 0:
@@ -799,6 +809,8 @@ def _targets_table(section_context, pagination, filter_, sorter, filterOptions, 
         if params_paged[-1] != (current - 1) * page_size:
             params_paged = params + [page_size, (current - 1) * page_size]
             with duckdb_connection(wdir) as conn:
+                if conn is None:
+                    raise PreventUpdate
                 dfpl = conn.execute(sql, params_paged).pl()
             
             data = (
@@ -820,6 +832,8 @@ def _targets_table(section_context, pagination, filter_, sorter, filterOptions, 
             number_records = int(data["__total__"][0]) if len(data) else 0
 
         with (duckdb_connection(wdir) as conn):
+            if conn is None:
+                raise PreventUpdate
             category_filters = conn.execute(
                 "SELECT DISTINCT category FROM targets ORDER BY category ASC"
             ).df()['category'].to_list()
@@ -840,8 +854,16 @@ def _targets_table(section_context, pagination, filter_, sorter, filterOptions, 
         # This avoids using pl.Object dtype which causes panic in frozen apps
         data_dicts = data.to_dicts()
         for row in data_dicts:
-            row['peak_selection'] = {'checked': bool(row.pop('peak_selection_resolved', False))}
-            row['bookmark'] = {'checked': bool(row.pop('bookmark_resolved', False))}
+            row['peak_selection'] = {
+                'checked': bool(row.pop('peak_selection_resolved', False)),
+                'checkedChildren': 'YES',
+                'unCheckedChildren': 'NO'
+            }
+            row['bookmark'] = {
+                'checked': bool(row.pop('bookmark_resolved', False)),
+                'checkedChildren': 'YES',
+                'unCheckedChildren': 'NO'
+            }
 
         return [
             data_dicts,
@@ -853,7 +875,7 @@ def _targets_table(section_context, pagination, filter_, sorter, filterOptions, 
     return dash.no_update
 
 
-def _target_delete(okCounts, selectedRows, clickedKey, wdir):
+def _target_delete(okCounts, selectedRows, clickedKey, wdir, workspace_status):
     if okCounts is None or clickedKey not in ['delete-selected', 'delete-all']:
         logger.debug(f"_target_delete: PreventUpdate because okCounts={okCounts}, clickedKey={clickedKey}")
         raise PreventUpdate
@@ -891,7 +913,8 @@ def _target_delete(okCounts, selectedRows, clickedKey, wdir):
                             showProgress=True,
                             stack=True
                         ),
-                        {'action': 'delete', 'status': 'failed'})
+                        {'action': 'delete', 'status': 'failed'},
+                        dash.no_update)
         total_removed = len(remove_targets)
         targets_action_store = {'action': 'delete', 'status': 'success'}
     elif clickedKey == "delete-all":
@@ -902,10 +925,18 @@ def _target_delete(okCounts, selectedRows, clickedKey, wdir):
             total_removed_q = conn.execute("SELECT COUNT(*) FROM targets").fetchone()
             targets_action_store = {'action': 'delete', 'status': 'failed'}
             total_removed = 0
+            should_compact = False
             if total_removed_q:
                 total_removed = total_removed_q[0]
 
                 try:
+                    # Check for derived data (chromatograms/results) to decide if compaction is needed
+                    # Only compact if we are deleting significant data to avoid "huge DB with only MS files"
+                    derived_count = conn.execute("SELECT (SELECT COUNT(*) FROM chromatograms) + (SELECT COUNT(*) FROM results)").fetchone()[0]
+                    should_compact = derived_count > 0
+                    if should_compact:
+                         logger.info(f"Targets delete-all: Found {derived_count} derived rows. Compaction will be triggered.")
+
                     conn.execute("BEGIN")
                     conn.execute("DELETE FROM targets")
                     conn.execute("DELETE FROM chromatograms")
@@ -924,9 +955,29 @@ def _target_delete(okCounts, selectedRows, clickedKey, wdir):
                                 showProgress=True,
                                 stack=True
                             ),
-                            {'action': 'delete', 'status': 'failed'})
+                            {'action': 'delete', 'status': 'failed'},
+                            dash.no_update)
+        
+        # Compact database only when clearing the entire table (outside the 'with' block)
+        if targets_action_store.get('status') == 'success' and should_compact:
+            compact_success, compact_msg = compact_database(wdir)
+            if compact_success:
+                logger.info(f"Database compacted after clearing targets: {compact_msg}")
+            else:
+                logger.warning(f"Failed to compact database: {compact_msg}")
+
+
+                logger.warning(f"Failed to compact database: {compact_msg}")
+
     if total_removed > 0:
         logger.info(f"Deleted {total_removed} targets.")
+
+    # Update workspace status
+    new_status = workspace_status or {}
+    with duckdb_connection(wdir) as conn:
+        if conn:
+            count = conn.execute("SELECT COUNT(*) FROM targets").fetchone()
+            new_status['targets_count'] = count[0] if count else 0
 
     return (fac.AntdNotification(message="Delete Targets",
                                  description=f"Deleted {total_removed} targets",
@@ -936,7 +987,9 @@ def _target_delete(okCounts, selectedRows, clickedKey, wdir):
                                  showProgress=True,
                                  stack=True
                                  ),
-            targets_action_store)
+            targets_action_store,
+            dash.no_update,
+            new_status)
 
 
 def _save_target_table_on_edit(row_edited, column_edited, wdir):
@@ -1217,19 +1270,26 @@ def callbacks(app, fsc=None, cache=None):
                 vertical=True,
             )
         return True, children
-
     @app.callback(
         Output('notifications-container', 'children', allow_duplicate=True),
         Output('targets-action-store', "data", allow_duplicate=True),
+        Output("targets-table-spin", "spinning"),
+        Output("workspace-status", "data", allow_duplicate=True),
 
         Input('delete-table-targets-modal', 'okCounts'),
         State('targets-table', 'selectedRows'),
         State("targets-options", "clickedKey"),
         State("wdir", "data"),
+        State("workspace-status", "data"),
+        background=True,
+        running=[
+            (Output("targets-table-spin", "spinning"), True, False),
+            (Output("delete-table-targets-modal", "confirmLoading"), True, False),
+        ],
         prevent_initial_call=True
     )
-    def target_delete(okCounts, selectedRows, clickedKey, wdir):
-        return _target_delete(okCounts, selectedRows, clickedKey, wdir)
+    def target_delete(okCounts, selectedRows, clickedKey, wdir, workspace_status):
+        return _target_delete(okCounts, selectedRows, clickedKey, wdir, workspace_status)
 
     @app.callback(
         Output("notifications-container", "children", allow_duplicate=True),

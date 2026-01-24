@@ -42,6 +42,7 @@ dependencies = [
   "flask-sqlalchemy",
   "flask_login",
   "lxml>=6.0.2",
+  "lttbc",
   "matplotlib>=3.10.8",
   "numpy==2.3.3",
   "openpyxl",
@@ -51,8 +52,10 @@ dependencies = [
   "polars==1.33.1",
   "psutil",
   "pyarrow==18.0.0",
+  "pygixml",
   "PyYAML",
   "pyteomics",
+  "scikit-learn",
   "scipy>=1.16.3",
   "seaborn",
   "sqlalchemy",
@@ -76,7 +79,7 @@ where = ["src"]
 include = ["ms_mint_app*"]
 
 [tool.setuptools.package-data]
-"ms_mint_app.assets" = ["*.css"]
+"ms_mint_app" = ["assets/*", "static/*", "static/**/*"]
 
 [tool.versioneer]
 VCS = "git"

@@ -8,9 +8,9 @@ from ms_mint_app.plugins.analysis import (
     rocke_durbin,
     run_pca_samples_in_cols,
     show_tab_content,
-    run_scalir,
     TAB_DEFAULT_NORM
 )
+from ms_mint_app.plugins.processing import run_scalir
 import duckdb
 from ms_mint_app.duckdb_manager import _create_tables
 
@@ -77,7 +77,7 @@ class TestAnalysisCallbacks:
         
         res = show_tab_content(
             {'page': 'Analysis'}, 'pca', 'PC1', 'PC2', [], 'peak_area', 'zscore',
-            'sample_type', 0, 10, 10, '/tmp/wdir'
+            'sample_type', 0, False, False, 10, 10, '/tmp/wdir'
         )
         
         # Outputs: bar_graph_matplotlib, pca_graph, violin_graphs, violin_opts, violin_val
@@ -97,12 +97,13 @@ class TestAnalysisCallbacks:
         
         res = show_tab_content(
              {'page': 'Analysis'}, 'pca', 'PC1', 'PC2', [], 'peak_area', 'zscore',
-            'sample_type', 0, 10, 10, '/tmp/wdir'
+            'sample_type', 0, False, False, 10, 10, '/tmp/wdir'
         )
         
         # Should return None/empty figs, not crash
         # Returns: None, empty_fig, [], [], []
-        assert res[1]['layout']['title']['text'] == "No results available"
+        # Returns: None, empty_fig, [], [], []
+        assert res[1].layout.height == 10
 
     @patch('ms_mint_app.plugins.analysis.dash.callback_context')
     @patch('ms_mint_app.plugins.analysis.duckdb_connection')
@@ -112,14 +113,14 @@ class TestAnalysisCallbacks:
         
         res = show_tab_content(
             {'page': 'Analysis'}, 'clustermap', 'PC1', 'PC2', [], 'peak_area', 'zscore',
-            'sample_type', 0, 10, 10, '/tmp/wdir'
+            'sample_type', 0, True, True, 10, 10, '/tmp/wdir'
         )
         
         # Outputs[0] is bar_graph_matplotlib (src string)
         assert isinstance(res[0], str)
         assert res[0].startswith('data:image/png;base64,')
 
-    @patch('ms_mint_app.plugins.analysis.duckdb_connection')
+    @patch('ms_mint_app.plugins.processing.duckdb_connection')
     def test_run_scalir_no_overlap(self, mock_conn, db_con):
         mock_conn.return_value.__enter__.return_value = db_con
         
@@ -134,13 +135,13 @@ class TestAnalysisCallbacks:
         
         res = run_scalir(
             1, contents, "std.csv", 'peak_area', 'fixed', 0.8, 1.2,
-            False, '/tmp/wdir', 'scalir', {'page': 'Analysis'}
+            False, '/tmp/wdir', {'page': 'Processing'}
         )
         
         # Returns tuple. First element is status string.
         assert "No overlapping peak_label" in res[0]
 
-    @patch('ms_mint_app.plugins.analysis.duckdb_connection')
+    @patch('ms_mint_app.plugins.processing.duckdb_connection')
     def test_run_scalir_happy_path(self, mock_conn, db_con):
         mock_conn.return_value.__enter__.return_value = db_con
         
@@ -157,7 +158,7 @@ class TestAnalysisCallbacks:
 
         res = run_scalir(
             1, contents, "std.csv", 'peak_area', 'fixed', 0.8, 1.2,
-            False, '/tmp/wdir', 'scalir', {'page': 'Analysis'}
+            False, '/tmp/wdir', {'page': 'Processing'}
         )
         
         # If successful, first element is status text starting with "Fitted..."

@@ -12,6 +12,7 @@ from unittest.mock import patch
 from ms_mint_app.duckdb_manager import (
     validate_mint_database,
     import_database_as_workspace,
+    compact_database,
     _create_tables,
     _create_workspace_tables,
     REQUIRED_TABLES,
@@ -234,3 +235,129 @@ class TestImportDatabaseAsWorkspace:
         
         assert old_active is False
         assert new_active is True
+
+
+class TestCompactDatabase:
+    """Tests for compact_database()."""
+
+    @pytest.fixture
+    def workspace_with_data(self, tmp_path):
+        """Create a workspace directory with database containing data."""
+        workspace_path = tmp_path / "workspace"
+        workspace_path.mkdir()
+        
+        db_file = workspace_path / "workspace_mint.db"
+        con = duckdb.connect(str(db_file))
+        _create_tables(con)
+        
+        # Insert substantial data to make file size meaningful
+        for i in range(100):
+            con.execute(
+                "INSERT INTO samples (ms_file_label, label) VALUES (?, ?)",
+                (f'file_{i}', f'Label {i}')
+            )
+            con.execute(
+                """INSERT INTO targets (peak_label, mz_mean, rt, rt_min, rt_max) 
+                   VALUES (?, ?, ?, ?, ?)""",
+                (f'target_{i}', 100.0 + i, 5.0, 4.0, 6.0)
+            )
+        
+        # Insert some ms1_data to increase file size
+        for i in range(50):
+            for j in range(100):
+                con.execute(
+                    """INSERT INTO ms1_data (ms_file_label, scan_id, mz, intensity, scan_time)
+                       VALUES (?, ?, ?, ?, ?)""",
+                    (f'file_{i}', j, 100.0 + j, 1000.0 * j, 0.1 * j)
+                )
+        
+        con.execute("CHECKPOINT")
+        con.close()
+        
+        return workspace_path
+
+    def test_compact_database_reduces_size_after_delete(self, workspace_with_data):
+        """Test that compacting reduces file size after data is deleted."""
+        workspace_path = workspace_with_data
+        db_file = workspace_path / "workspace_mint.db"
+        
+        # Get initial size after data insertion
+        initial_size = db_file.stat().st_size
+        
+        # Delete the big data (ms1_data)
+        con = duckdb.connect(str(db_file))
+        con.execute("DELETE FROM ms1_data")
+        con.execute("CHECKPOINT")
+        con.close()
+        
+        # Size after delete (DuckDB doesn't reclaim space)
+        size_after_delete = db_file.stat().st_size
+        
+        # Compact the database
+        success, message = compact_database(workspace_path)
+        
+        assert success is True
+        assert "Compacted" in message
+        
+        # Size after compaction should be smaller
+        final_size = db_file.stat().st_size
+        
+        # The final size should be less than before (significant reduction expected)
+        assert final_size < size_after_delete, \
+            f"Expected size reduction: {size_after_delete} -> {final_size}"
+
+    def test_compact_database_preserves_data(self, workspace_with_data):
+        """Test that compacting preserves all remaining data."""
+        workspace_path = workspace_with_data
+        db_file = workspace_path / "workspace_mint.db"
+        
+        # Delete some data
+        con = duckdb.connect(str(db_file))
+        con.execute("DELETE FROM samples WHERE ms_file_label LIKE 'file_5%'")
+        con.execute("DELETE FROM targets WHERE peak_label LIKE 'target_5%'")
+        remaining_samples = con.execute("SELECT COUNT(*) FROM samples").fetchone()[0]
+        remaining_targets = con.execute("SELECT COUNT(*) FROM targets").fetchone()[0]
+        con.close()
+        
+        # Compact
+        success, _ = compact_database(workspace_path)
+        assert success is True
+        
+        # Verify data is preserved
+        con = duckdb.connect(str(db_file))
+        samples_after = con.execute("SELECT COUNT(*) FROM samples").fetchone()[0]
+        targets_after = con.execute("SELECT COUNT(*) FROM targets").fetchone()[0]
+        con.close()
+        
+        assert samples_after == remaining_samples
+        assert targets_after == remaining_targets
+
+    def test_compact_database_nonexistent_path(self, tmp_path):
+        """Test compacting a non-existent database."""
+        success, message = compact_database(tmp_path / "nonexistent")
+        
+        assert success is False
+        assert "not found" in message.lower()
+
+    def test_compact_database_handles_empty_tables(self, tmp_path):
+        """Test compacting a database with empty tables."""
+        workspace_path = tmp_path / "workspace"
+        workspace_path.mkdir()
+        
+        db_file = workspace_path / "workspace_mint.db"
+        con = duckdb.connect(str(db_file))
+        _create_tables(con)
+        con.close()
+        
+        # Should succeed even with empty tables
+        success, _ = compact_database(workspace_path)
+        
+        assert success is True
+        
+        # Verify database is still valid
+        con = duckdb.connect(str(db_file))
+        tables = [row[0] for row in con.execute("SHOW TABLES").fetchall()]
+        con.close()
+        
+        assert 'samples' in tables
+        assert 'targets' in tables

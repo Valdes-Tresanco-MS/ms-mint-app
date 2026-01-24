@@ -5,50 +5,233 @@ from threading import Thread
 import duckdb
 import time
 import logging
+import math
+import numpy as np
 
 logger = logging.getLogger(__name__)
 
+try:
+    import lttbc as _lttbc
+except Exception:
+    _lttbc = None
+
+try:
+    from scipy.signal import savgol_filter as _savgol_filter
+except Exception:
+    _savgol_filter = None
 from .sample_metadata import GROUP_COLUMNS
 
+FULL_RANGE_DOWNSAMPLE_POINTS = 1000
+FULL_RANGE_DOWNSAMPLE_BATCH = 200
+FULL_RANGE_SAVGOL_WINDOW = 10
+FULL_RANGE_SAVGOL_ORDER = 2
 
-def calculate_optimal_batch_size(ram_gb: int, total_pairs: int, n_cpus: int = None) -> int:
+
+def _apply_lttb_downsampling(scan_time, intensity, n_out=FULL_RANGE_DOWNSAMPLE_POINTS):
+    if n_out is None:
+        n_out = FULL_RANGE_DOWNSAMPLE_POINTS
+
+    try:
+        n_out = int(n_out)
+    except (TypeError, ValueError):
+        return scan_time, intensity
+
+    if _lttbc is None:
+        return scan_time, intensity
+
+    if not scan_time or n_out <= 0 or len(scan_time) <= n_out:
+        return scan_time, intensity
+
+    downsampled_x, downsampled_y = _lttbc.downsample(scan_time, intensity, n_out)
+    if len(downsampled_x) == 0:
+        return scan_time, intensity
+
+    return downsampled_x, downsampled_y
+
+
+def _savgol_coeffs_numpy(window_length, polyorder, deriv=0, delta=1.0):
+    half_window = window_length // 2
+    pos = np.arange(-half_window, half_window + 1, dtype=float)
+    a = np.vander(pos, polyorder + 1, increasing=True)
+    b = np.zeros(polyorder + 1, dtype=float)
+    b[deriv] = math.factorial(deriv) / (delta ** deriv)
+    return np.linalg.lstsq(a.T, b, rcond=None)[0]
+
+
+def _savgol_filter_numpy(intensity, window_length, polyorder):
+    intensity = np.asarray(intensity, dtype=float)
+    n_points = intensity.size
+    if n_points == 0:
+        return intensity
+
+    half_window = window_length // 2
+    if n_points < window_length:
+        return intensity
+
+    coeffs = _savgol_coeffs_numpy(window_length, polyorder)
+    filtered = np.empty_like(intensity, dtype=float)
+
+    interior = np.convolve(intensity, coeffs[::-1], mode='valid')
+    filtered[half_window:-half_window] = interior
+
+    x = np.arange(window_length, dtype=float)
+    left_poly = np.polyfit(x, intensity[:window_length], polyorder)
+    filtered[:half_window] = np.polyval(left_poly, x[:half_window])
+    right_poly = np.polyfit(x, intensity[-window_length:], polyorder)
+    filtered[-half_window:] = np.polyval(right_poly, x[-half_window:])
+
+    return filtered
+
+
+def _apply_savgol_smoothing(intensity,
+                            window_length=FULL_RANGE_SAVGOL_WINDOW,
+                            polyorder=FULL_RANGE_SAVGOL_ORDER):
+    if window_length is None:
+        window_length = FULL_RANGE_SAVGOL_WINDOW
+    if polyorder is None:
+        polyorder = FULL_RANGE_SAVGOL_ORDER
+
+    try:
+        window_length = int(window_length)
+        polyorder = int(polyorder)
+    except (TypeError, ValueError):
+        return intensity
+
+    if window_length < 3:
+        return intensity
+
+    if window_length % 2 == 0:
+        window_length -= 1
+
+    intensity = np.asarray(intensity, dtype=float)
+    n_points = intensity.size
+    if n_points < 3:
+        return intensity
+
+    if window_length > n_points:
+        window_length = n_points if n_points % 2 == 1 else n_points - 1
+
+    if window_length < 3:
+        return intensity
+
+    if polyorder < 0:
+        polyorder = 0
+    if polyorder >= window_length:
+        polyorder = window_length - 1
+
+    if _savgol_filter is not None:
+        smoothed = _savgol_filter(intensity, window_length, polyorder, mode='interp')
+    else:
+        smoothed = _savgol_filter_numpy(intensity, window_length, polyorder)
+
+    return np.maximum(smoothed, 1.0)
+
+
+def get_physical_cores() -> int:
     """
-    Calculate optimal batch size for chromatogram/results extraction based on resources.
+    Get the number of physical CPU cores (not hyperthreads).
+    Falls back to os.cpu_count() // 2 if psutil can't detect.
+    """
+    import os
+    import psutil
     
-    Formula:
-    - Base: 500 pairs
-    - RAM factor: scales by 4GB increments (1000 per 4GB)
-    - CPU factor: scales with cores (max 2x boost)
-    - Cap: 10000 (diminishing returns above this)
-    - Minimum: 500 (to avoid too many small batches)
-    - At least 10 batches for progress reporting
+    physical = psutil.cpu_count(logical=False)
+    if physical is None:
+        # Fallback: assume hyperthreading, so divide logical by 2
+        physical = max(1, (os.cpu_count() or 4) // 2)
+    return physical
+
+
+def calculate_optimal_params(user_cpus: int = None, user_ram: int = None) -> tuple:
+    """
+    Calculate optimal CPU, RAM, and batch_size based on system resources.
+    
+    Algorithm (data-driven from experimental benchmarks):
+    1. CPUs: min(logical // 2, physical_cores) - avoids hyperthreads
+    2. RAM: 50% of available, balanced with 1GB per CPU minimum
+    3. Batch: 500 × RAM_GB, capped at 8000
+    
+    If user provides explicit values, those are used instead of auto-detection.
     
     Args:
-        ram_gb: Available RAM in GB for DuckDB
-        total_pairs: Total number of pairs to process
-        n_cpus: Number of CPUs allocated to DuckDB
+        user_cpus: Optional user-specified CPU count
+        user_ram: Optional user-specified RAM in GB
+        
+    Returns:
+        (cpus, ram_gb, batch_size) tuple
+    """
+    import os
+    import psutil
+    
+    # Step 1: CPU calculation
+    if user_cpus is not None:
+        target_cpus = user_cpus
+    else:
+        logical_cores = os.cpu_count() or 4
+        physical_cores = get_physical_cores()
+        # Use half of logical, but never exceed physical (no hyperthreading benefit)
+        target_cpus = min(logical_cores // 2, physical_cores)
+        target_cpus = max(1, target_cpus)  # At least 1 CPU
+    
+    # Step 2: RAM calculation
+    if user_ram is not None:
+        usable_ram = user_ram
+    else:
+        available_ram = psutil.virtual_memory().available / (1024 ** 3)
+        usable_ram = int(available_ram * 0.5)  # 50% of available
+        usable_ram = max(4, usable_ram)  # Minimum 4GB
+    
+    # Step 3: Balance CPUs and RAM (1GB per CPU minimum)
+    if usable_ram < target_cpus:
+        # RAM is limiting factor - reduce CPUs to match
+        cpus = usable_ram
+        ram_gb = usable_ram
+    else:
+        # CPU is limiting factor
+        cpus = target_cpus
+        # Cap RAM at 2× CPUs (no benefit beyond that based on experiments)
+        ram_gb = min(usable_ram, cpus * 2)
+    
+    # Step 4: Batch size optimization
+    # Benchmarks (Jan 2026) showed 1000-3000 is the "sweet spot" for throughput
+    # and stability. Larger batches (5000+) reduced speed by 3x and increased crash risk.
+    # New formula: 200 * RAM_GB, capped at 3000.
+    batch_size = min(200 * ram_gb, 3000)
+    batch_size = max(1000, batch_size)  # Minimum 1000 for efficiency
+    
+    return cpus, ram_gb, batch_size
+
+
+def calculate_optimal_batch_size(ram_gb: int = None, total_pairs: int = 0, n_cpus: int = None) -> int:
+    """
+    Calculate optimal batch size for chromatogram/results extraction.
+    
+    This is a simplified wrapper around calculate_optimal_params() for
+    backward compatibility with existing code that only needs batch_size.
+    
+    Formula (revised Jan 2026 based on large dataset benchmarks):
+    - batch = 200 × RAM_GB, capped at 3000
+    - Experiments showed batch 1000 was 3x faster than batch 5000
+    - Large batches (8000+) caused high memory pressure and crashes
+    
+    Args:
+        ram_gb: RAM in GB. If None, auto-calculates 50% of available.
+        total_pairs: Total pairs (used for progress reporting constraint)
+        n_cpus: Number of CPUs (used for balancing with RAM)
         
     Returns:
         Optimal batch size
     """
-    ram_gb = ram_gb or 16  # Default to 16GB if not specified
-    
-    # RAM factor: 1000 pairs per 4GB (using float division for smooth scaling)
-    ram_factor = max(ram_gb, 4) / 4
-    
-    # CPU factor: modest scaling (max 1.5x boost)
-    # Based on benchmarks: larger batches have diminishing returns
-    effective_cpus = min(n_cpus or 4, ram_gb)  # Cap CPUs at RAM GB
-    cpu_factor = min(effective_cpus / 8 + 0.5, 1.5)  # Gentler scaling, max 1.5x
-    
-    base_batch = 750  # Conservative base for good throughput
-    optimal = int(base_batch * ram_factor * cpu_factor)
+    _, effective_ram, batch_size = calculate_optimal_params(
+        user_cpus=n_cpus,
+        user_ram=ram_gb
+    )
     
     # Ensure at least 10 batches for progress reporting
     if total_pairs > 0:
-        optimal = min(optimal, max(total_pairs // 10, 500))
+        batch_size = min(batch_size, max(total_pairs // 10, 500))
     
-    return min(max(optimal, 500), 8000)  # Cap at 8000 (benchmarks show diminishing returns above 5000)
+    return batch_size
 
 
 def get_effective_cpus(n_cpus: int, ram_gb: int) -> int:
@@ -64,7 +247,7 @@ def get_effective_cpus(n_cpus: int, ram_gb: int) -> int:
     """
     if not n_cpus or not ram_gb:
         return n_cpus or 4  # Default to 4 if not specified
-    return min(n_cpus, ram_gb*2)
+    return min(n_cpus, ram_gb)
 
 
 # Required tables and their core columns for validation
@@ -312,6 +495,49 @@ def _update_workspace_activity(mint_root: Path, workspace_id: str, retries: int 
             return
 
 
+class DatabaseCorruptionError(Exception):
+    """Raised when the DuckDB file is corrupted."""
+    pass
+
+
+# Global tracker for corrupted workspaces - allows plugins to show notifications
+_corrupted_workspaces: set[str] = set()
+
+
+def is_workspace_corrupted(workspace_path: Path | str) -> bool:
+    """Check if a workspace has been marked as corrupted."""
+    if not workspace_path:
+        return False
+    return str(workspace_path) in _corrupted_workspaces
+
+
+def clear_corruption_flag(workspace_path: Path | str):
+    """Clear the corruption flag for a workspace (e.g., after user acknowledges)."""
+    _corrupted_workspaces.discard(str(workspace_path))
+
+
+def _mark_corrupted(workspace_path: Path | str):
+    """Mark a workspace as corrupted."""
+    _corrupted_workspaces.add(str(workspace_path))
+
+
+def get_corruption_notification():
+    """
+    Returns a notification component for a corrupted database.
+    
+    Plugins can use this when they detect conn is None and is_workspace_corrupted() is True.
+    Returns a dict suitable for fac.AntdNotification or None if not applicable.
+    """
+    return {
+        'message': "⚠️ Database Corrupted",
+        'description': "This workspace has a corrupted database. Please delete it and restore from backup or recreate the workspace.",
+        'type': "error",
+        'duration': 10,
+        'placement': 'bottom',
+        'showProgress': True,
+    }
+
+
 @contextmanager
 def duckdb_connection(workspace_path: Path | str, register_activity=True, n_cpus=None, ram=None):
     """
@@ -353,6 +579,20 @@ def duckdb_connection(workspace_path: Path | str, register_activity=True, n_cpus
             actual_limit = con.execute("SELECT current_setting('memory_limit')").fetchone()[0]
             logger.info(f"DuckDB memory_limit set to {ram}GB (verified: {actual_limit})")
         _create_tables(con)
+    except duckdb.IOException as e:
+        if "Corrupt database file" in str(e):
+            _mark_corrupted(workspace_path)  # Mark for UI notification
+            logger.critical(
+                f"⚠️ DATABASE CORRUPTION DETECTED in {db_file}: {e}\n"
+                "This usually happens due to a system crash or forced termination during a write operation.\n"
+                "Please delete this workspace and restore from backup or recreate it."
+            )
+            # Return None so that all existing "if conn is None" checks handle this gracefully
+            yield None
+            return
+        logger.error(f"Error connecting to DuckDB: {e}")
+        yield None
+        return
     except Exception as e:
         logger.error(f"Error connecting to DuckDB: {e}")
         yield None
@@ -402,6 +642,145 @@ def duckdb_connection_mint(mint_path: Path, workspace=None):
             con.close()
 
 
+def compact_database(workspace_path: Path | str, max_retries: int = 5, initial_delay: float = 0.5) -> tuple[bool, str]:
+    """
+    Compact the workspace database by rebuilding it.
+    
+    DuckDB doesn't automatically reclaim space after DELETEs, so this function
+    creates a new database file with only the current data, then replaces
+    the old file.
+    
+    Args:
+        workspace_path: Path to the workspace directory
+        max_retries: Maximum number of retry attempts for lock conflicts
+        initial_delay: Initial delay between retries (doubles each attempt)
+        
+    Returns:
+        (success, error_message)
+    """
+    import shutil
+    import uuid
+    
+    workspace_path = Path(workspace_path)
+    db_file = workspace_path / 'workspace_mint.db'
+    
+    if not db_file.exists():
+        return False, f"Database file not found: {db_file}"
+    
+    # Get original file size for logging
+    original_size = db_file.stat().st_size
+    original_size_mb = original_size / (1024 * 1024)
+    
+    # Create temporary file name for the new database
+    temp_db_file = workspace_path / f'workspace_mint_{uuid.uuid4().hex[:8]}.db.tmp'
+    backup_file = workspace_path / 'workspace_mint.db.bak'
+    
+    try:
+        # Create new database and copy all tables
+        new_con = None
+        try:
+            new_con = duckdb.connect(database=str(temp_db_file), read_only=False)
+            new_con.execute("PRAGMA enable_checkpoint_on_shutdown")
+            
+            # Limit memory to 50% of available RAM to prevent system freeze
+            import psutil
+            available_ram_gb = psutil.virtual_memory().available / (1024 ** 3)
+            memory_limit_gb = max(2, int(available_ram_gb * 0.5))  # At least 2GB, max 50%
+            new_con.execute(f"SET memory_limit = '{memory_limit_gb}GB'")
+            logger.debug(f"Compaction memory limit set to {memory_limit_gb}GB (50% of {available_ram_gb:.1f}GB available)")
+            
+            # Create all types and tables in the new database
+            _create_tables(new_con)
+            
+            # Attach the old database with retry logic for lock conflicts
+            delay = initial_delay
+            attached = False
+            last_error = None
+            
+            for attempt in range(max_retries):
+                try:
+                    new_con.execute(f"ATTACH '{db_file}' AS old_db (READ_ONLY)")
+                    attached = True
+                    break
+                except duckdb.IOException as e:
+                    last_error = e
+                    if "lock" in str(e).lower() and attempt < max_retries - 1:
+                        logger.debug(f"Compact: lock conflict on attach, retry {attempt + 1}/{max_retries} after {delay:.1f}s")
+                        time.sleep(delay)
+                        delay *= 2  # Exponential backoff
+                    else:
+                        raise
+            
+            if not attached:
+                raise last_error or Exception("Failed to attach old database")
+            
+            # Copy data from all tables
+            tables_to_copy = ['samples', 'targets', 'ms1_data', 'ms2_data', 'chromatograms', 'results']
+            for table in tables_to_copy:
+                # Check if table has data in old database
+                try:
+                    count = new_con.execute(f"SELECT COUNT(*) FROM old_db.{table}").fetchone()[0]
+                    if count > 0:
+                        # Copy data - INSERT INTO ... SELECT * FROM ...
+                        new_con.execute(f"INSERT INTO {table} SELECT * FROM old_db.{table}")
+                        logger.debug(f"Compacted table '{table}': {count} rows")
+                except Exception as e:
+                    # Table might not exist in old DB, which is fine
+                    logger.debug(f"Skipping table '{table}' during compaction: {e}")
+            
+            # Detach old database
+            new_con.execute("DETACH old_db")
+            
+            # Checkpoint to ensure all data is written
+            new_con.execute("CHECKPOINT")
+            
+        finally:
+            if new_con:
+                new_con.close()
+        
+        # Now swap the files
+        # Rename old to backup
+        if backup_file.exists():
+            backup_file.unlink()
+        db_file.rename(backup_file)
+        
+        # Rename new to original
+        temp_db_file.rename(db_file)
+        
+        # Remove backup
+        if backup_file.exists():
+            backup_file.unlink()
+        
+        # Log the size reduction
+        new_size = db_file.stat().st_size
+        new_size_mb = new_size / (1024 * 1024)
+        reduction_pct = ((original_size - new_size) / original_size * 100) if original_size > 0 else 0
+        
+        logger.info(f"Database compacted: {original_size_mb:.1f}MB -> {new_size_mb:.1f}MB ({reduction_pct:.0f}% reduction)")
+        
+        return True, f"Compacted {original_size_mb:.1f}MB -> {new_size_mb:.1f}MB"
+        
+    except Exception as e:
+        logger.error(f"Error compacting database: {e}", exc_info=True)
+        
+        # Cleanup: restore backup if it exists
+        if backup_file.exists() and not db_file.exists():
+            try:
+                backup_file.rename(db_file)
+                logger.info("Restored database from backup after failed compaction")
+            except Exception as restore_error:
+                logger.error(f"Failed to restore backup: {restore_error}")
+        
+        # Remove temp file if it exists
+        if temp_db_file.exists():
+            try:
+                temp_db_file.unlink()
+            except Exception:
+                pass
+        
+        return False, str(e)
+
+
 def _create_tables(conn: duckdb.DuckDBPyConnection):
     # Create tables if they don't exist
     conn.execute("CREATE TYPE IF NOT EXISTS ms_type_enum AS ENUM ('ms1', 'ms2');")
@@ -432,6 +811,7 @@ def _create_tables(conn: duckdb.DuckDBPyConnection):
     # Backfill new processing flag for existing DBs
     conn.execute("ALTER TABLE samples ADD COLUMN IF NOT EXISTS use_for_processing BOOLEAN DEFAULT true;")
     conn.execute("ALTER TABLE samples ADD COLUMN IF NOT EXISTS file_type VARCHAR;")
+    conn.execute("ALTER TABLE samples ADD COLUMN IF NOT EXISTS acquisition_datetime TIMESTAMP;")
     for col in GROUP_COLUMNS:
         conn.execute(f"ALTER TABLE samples ADD COLUMN IF NOT EXISTS {col} VARCHAR;")
     try:
@@ -508,8 +888,10 @@ def _create_tables(conn: duckdb.DuckDBPyConnection):
                      ms_file_label VARCHAR,
                      scan_time     DOUBLE[],
                      intensity     DOUBLE[],
+                     scan_time_full_ds DOUBLE[],
+                     intensity_full_ds DOUBLE[],
+                     mz_arr        DOUBLE[],
                      ms_type       ms_type_enum,
-                     -- mz            DOUBLE[],
                      PRIMARY KEY (ms_file_label, peak_label)
                  );
                  """)
@@ -535,17 +917,50 @@ def _create_tables(conn: duckdb.DuckDBPyConnection):
                      PRIMARY KEY (ms_file_label, peak_label)
                  );
                  """)
+
+    # Migration: Add mz_arr column to chromatograms table
+    try:
+        chrom_cols = {row[0] for row in conn.execute("DESCRIBE chromatograms").fetchall()}
+        if 'mz_arr' not in chrom_cols:
+            conn.execute("ALTER TABLE chromatograms ADD COLUMN mz_arr DOUBLE[]")
+            logger.debug("Migration: Added 'mz_arr' column to chromatograms table")
+        if 'scan_time_full_ds' not in chrom_cols:
+            conn.execute("ALTER TABLE chromatograms ADD COLUMN scan_time_full_ds DOUBLE[]")
+            logger.debug("Migration: Added 'scan_time_full_ds' column to chromatograms table")
+        if 'intensity_full_ds' not in chrom_cols:
+            conn.execute("ALTER TABLE chromatograms ADD COLUMN intensity_full_ds DOUBLE[]")
+            logger.debug("Migration: Added 'intensity_full_ds' column to chromatograms table")
+    except Exception:
+        pass
     
-    # Migration: Add rt_aligned and rt_shift columns to existing results tables
+    # Migration: Add rt_aligned, rt_shift, peak_mz_of_max columns to existing results tables
     existing_cols = {
         row[0] for row in conn.execute("DESCRIBE results").fetchall()
     }
     if 'rt_aligned' not in existing_cols:
         conn.execute("ALTER TABLE results ADD COLUMN rt_aligned BOOLEAN")
-        logger.info("Migration: Added 'rt_aligned' column to results table")
+        logger.debug("Migration: Added 'rt_aligned' column to results table")
     if 'rt_shift' not in existing_cols:
         conn.execute("ALTER TABLE results ADD COLUMN rt_shift DOUBLE")
-        logger.info("Migration: Added 'rt_shift' column to results table")
+        logger.debug("Migration: Added 'rt_shift' column to results table")
+    if 'peak_mz_of_max' not in existing_cols:
+        conn.execute("ALTER TABLE results ADD COLUMN peak_mz_of_max DOUBLE")
+        logger.debug("Migration: Added 'peak_mz_of_max' column to results table")
+    
+    # Migration: Add EMG peak fitting columns to existing results tables
+    fitting_columns = {
+        'peak_area_fitted': 'DOUBLE',      # Area under fitted EMG curve
+        'peak_sigma': 'DOUBLE',            # Gaussian width (σ)
+        'peak_tau': 'DOUBLE',              # Exponential tail decay (τ/gamma)
+        'peak_asymmetry': 'DOUBLE',        # τ/σ ratio
+        'peak_rt_fitted': 'DOUBLE',        # Peak center from EMG fit
+        'fit_r_squared': 'DOUBLE',         # Goodness of fit (R²)
+        'fit_success': 'BOOLEAN',          # Whether fitting converged
+    }
+    for col_name, col_type in fitting_columns.items():
+        if col_name not in existing_cols:
+            conn.execute(f"ALTER TABLE results ADD COLUMN {col_name} {col_type}")
+            logger.debug(f"Migration: Added '{col_name}' column to results table")
 
 
 
@@ -775,20 +1190,20 @@ def compute_and_insert_chromatograms_from_ms_data(con: duckdb.DuckDBPyConnection
                                                      CROSS JOIN samples_to_use s
                                             WHERE t.mz_mean IS NOT NULL
                                                 AND t.mz_width IS NOT NULL
-                                                AND t.peak_selection IS TRUE
-                                               OR NOT EXISTS (SELECT 1
-                                                              FROM targets t1
-                                                              WHERE t1.peak_selection IS TRUE)
+                                                AND (t.peak_selection IS TRUE
+                                                   OR NOT EXISTS (SELECT 1
+                                                                  FROM targets t1
+                                                                  WHERE t1.peak_selection IS TRUE))
                                                 AND
                                                   EXISTS(SELECT 1 FROM ms1_data md WHERE md.ms_file_label = s.ms_file_label)),
                             ms2_targets AS (SELECT DISTINCT t.peak_label, s.ms_file_label
                                             FROM targets t
                                                      CROSS JOIN samples_to_use s
                                             WHERE t.filterLine IS NOT NULL -- ensures this is MS2
-                                                AND t.peak_selection IS TRUE
-                                               OR NOT EXISTS (SELECT 1
-                                                              FROM targets t1
-                                                              WHERE t1.peak_selection IS TRUE)
+                                                AND (t.peak_selection IS TRUE
+                                                   OR NOT EXISTS (SELECT 1
+                                                                  FROM targets t1
+                                                                  WHERE t1.peak_selection IS TRUE))
                                                 AND
                                                   EXISTS(SELECT 1 FROM ms2_data md WHERE md.ms_file_label = s.ms_file_label)),
                             existing_chromatograms AS (SELECT DISTINCT peak_label, ms_file_label
@@ -853,10 +1268,10 @@ def compute_and_insert_chromatograms_from_ms_data(con: duckdb.DuckDBPyConnection
                                     OR s.use_for_processing = TRUE
                                      AND t.mz_mean IS NOT NULL
                                      AND t.mz_width IS NOT NULL
-                                     AND t.peak_selection IS TRUE
-                                    OR NOT EXISTS (SELECT 1
-                                                   FROM targets t1
-                                                   WHERE t1.peak_selection IS TRUE)
+                                     AND (t.peak_selection IS TRUE
+                                        OR NOT EXISTS (SELECT 1
+                                                       FROM targets t1
+                                                       WHERE t1.peak_selection IS TRUE))
                                      AND chromatograms.peak_label = t.peak_label
                                      AND chromatograms.ms_file_label = s.ms_file_label)
                     """)
@@ -875,10 +1290,10 @@ def compute_and_insert_chromatograms_from_ms_data(con: duckdb.DuckDBPyConnection
                                  WHERE s.use_for_optimization = TRUE
                                     OR s.use_for_processing = TRUE
                                      AND t.filterLine IS NOT NULL
-                                     AND t.peak_selection IS TRUE
-                                    OR NOT EXISTS (SELECT 1
-                                                   FROM targets t1
-                                                   WHERE t1.peak_selection IS TRUE)
+                                     AND (t.peak_selection IS TRUE
+                                        OR NOT EXISTS (SELECT 1
+                                                       FROM targets t1
+                                                       WHERE t1.peak_selection IS TRUE))
                                      AND chromatograms.peak_label = t.peak_label
                                      AND chromatograms.ms_file_label = s.ms_file_label)
                     """)
@@ -898,8 +1313,8 @@ def compute_and_insert_chromatograms_from_ms_data(con: duckdb.DuckDBPyConnection
                 WITH pairs_to_process AS (SELECT t.peak_label,
                                                  t.mz_mean,
                                                  t.mz_width,
-                                                 t.rt_min,
-                                                 t.rt_max,
+                                                 CASE WHEN t.rt_unit = 'min' THEN t.rt_min * 60 ELSE t.rt_min END AS rt_min,
+                                                 CASE WHEN t.rt_unit = 'min' THEN t.rt_max * 60 ELSE t.rt_max END AS rt_max,
                                                  s.ms_file_label
                                           FROM targets t
                                                    JOIN samples s
@@ -907,10 +1322,10 @@ def compute_and_insert_chromatograms_from_ms_data(con: duckdb.DuckDBPyConnection
                                                            TRUE
                                           WHERE t.mz_mean IS NOT NULL
                                               AND t.mz_width IS NOT NULL
-                                              AND t.peak_selection IS TRUE
-                                             OR NOT EXISTS (SELECT 1
-                                                            FROM targets t1
-                                                            WHERE t1.peak_selection IS TRUE)
+                                              AND (t.peak_selection IS TRUE
+                                                 OR NOT EXISTS (SELECT 1
+                                                                FROM targets t1
+                                                                WHERE t1.peak_selection IS TRUE))
                                               AND (
                                                     ? -- recompute_ms1
                                                         OR NOT EXISTS (SELECT 1
@@ -949,18 +1364,18 @@ def compute_and_insert_chromatograms_from_ms_data(con: duckdb.DuckDBPyConnection
                 INSERT INTO chromatograms (peak_label, ms_file_label, scan_time, intensity, ms_type)
                 WITH pairs_to_process AS (SELECT t.peak_label,
                                                  t.filterLine,
-                                                 t.rt_min,
-                                                 t.rt_max,
+                                                 CASE WHEN t.rt_unit = 'min' THEN t.rt_min * 60 ELSE t.rt_min END AS rt_min,
+                                                 CASE WHEN t.rt_unit = 'min' THEN t.rt_max * 60 ELSE t.rt_max END AS rt_max,
                                                  s.ms_file_label
                                           FROM targets AS t
                                                    JOIN samples s
                                                         ON (CASE WHEN ? THEN s.use_for_optimization ELSE s.use_for_processing END) =
                                                            TRUE
                                           WHERE t.filterLine IS NOT NULL
-                                              AND t.peak_selection IS TRUE
-                                             OR NOT EXISTS (SELECT 1
-                                                            FROM targets t1
-                                                            WHERE t1.peak_selection IS TRUE)
+                                              AND (t.peak_selection IS TRUE
+                                                 OR NOT EXISTS (SELECT 1
+                                                                FROM targets t1
+                                                                WHERE t1.peak_selection IS TRUE))
                                               AND (
                                                     ? -- recompute_ms2
                                                         OR NOT EXISTS (SELECT 1
@@ -1109,6 +1524,7 @@ def compute_chromatograms_in_batches(wdir: str,
                                                                filterLine,
                                                                rt_min,
                                                                rt_max,
+                                                               rt_unit,
                                                                bookmark
                                                         FROM targets t
                                                         WHERE (
@@ -1138,8 +1554,8 @@ def compute_chromatograms_in_batches(wdir: str,
                                                                     t.mz_mean,
                                                                     t.mz_width,
                                                                     t.filterLine,
-                                                                    t.rt_min,
-                                                                    t.rt_max
+                                                                    CASE WHEN t.rt_unit = 'min' THEN t.rt_min * 60 ELSE t.rt_min END AS rt_min,
+                                                                    CASE WHEN t.rt_unit = 'min' THEN t.rt_max * 60 ELSE t.rt_max END AS rt_max
                                                              FROM target_filter t
                                                                       CROSS JOIN sample_filter s),
                                       pending AS (SELECT a.peak_label,
@@ -1171,24 +1587,35 @@ def compute_chromatograms_in_batches(wdir: str,
                                  """
 
     QUERY_PROCESS_BATCH_MS1 = """
-                              INSERT INTO chromatograms (peak_label, ms_file_label, scan_time, intensity, ms_type)
+                              INSERT INTO chromatograms (peak_label, ms_file_label, scan_time, intensity, mz_arr, ms_type)
                               WITH batch_pairs AS (SELECT peak_label, ms_file_label, ms_type, mz_mean, mz_width, rt_min, rt_max
                                                    FROM pending_pairs
                                                    WHERE ms_type = 'ms1'
                                                      AND pair_id BETWEEN ? AND ?),
-                                   -- Step 1: Find intensities (only rows with signal)
-                                   matched_intensities AS (SELECT bp.peak_label,
-                                                                  bp.ms_file_label,
-                                                                  ms1.scan_id,
-                                                                  MAX(ms1.intensity) AS intensity
-                                                           FROM batch_pairs bp
-                                                                    JOIN ms1_data ms1
-                                                                         ON ms1.ms_file_label = bp.ms_file_label
-                                                                             AND ms1.mz BETWEEN
-                                                                                bp.mz_mean - (bp.mz_mean * bp.mz_width / 1e6)
-                                                                                AND
-                                                                                bp.mz_mean + (bp.mz_mean * bp.mz_width / 1e6)
-                                                           GROUP BY bp.peak_label, bp.ms_file_label, ms1.scan_id),
+                                   -- Step 1: Find max intensity and corresponding mz per scan
+                                   matched_with_mz AS (
+                                       SELECT bp.peak_label,
+                                              bp.ms_file_label,
+                                              ms1.scan_id,
+                                              ms1.intensity,
+                                              ms1.mz,
+                                              ROW_NUMBER() OVER (
+                                                  PARTITION BY bp.peak_label, bp.ms_file_label, ms1.scan_id
+                                                  ORDER BY ms1.intensity DESC
+                                              ) AS rn
+                                       FROM batch_pairs bp
+                                       JOIN ms1_data ms1
+                                            ON ms1.ms_file_label = bp.ms_file_label
+                                                AND ms1.mz BETWEEN
+                                                   bp.mz_mean - (bp.mz_mean * bp.mz_width / 1e6)
+                                                   AND
+                                                   bp.mz_mean + (bp.mz_mean * bp.mz_width / 1e6)
+                                   ),
+                                   matched_intensities AS (
+                                       SELECT peak_label, ms_file_label, scan_id, intensity, mz
+                                       FROM matched_with_mz
+                                       WHERE rn = 1
+                                   ),
                                    -- Step 2: Expand to scans within RT window (±30s margin)
                                    all_scans_needed AS (SELECT DISTINCT bp.peak_label,
                                                                         bp.ms_file_label,
@@ -1204,8 +1631,8 @@ def compute_chromatograms_in_batches(wdir: str,
                                                             a.ms_file_label,
                                                             a.scan_time,
                                                             a.scan_id,
-                                                            a.scan_time,
-                                                            COALESCE(ROUND(m.intensity, 0), 1) AS intensity
+                                                            COALESCE(ROUND(m.intensity, 0), 1) AS intensity,
+                                                            m.mz AS mz_val
                                                      FROM all_scans_needed a
                                                               LEFT JOIN matched_intensities m
                                                                         ON a.peak_label = m.peak_label
@@ -1214,10 +1641,11 @@ def compute_chromatograms_in_batches(wdir: str,
                                    agg AS (SELECT peak_label,
                                                   ms_file_label,
                                                   LIST(scan_time ORDER BY scan_time) AS scan_time,
-                                                  LIST(intensity ORDER BY scan_time) AS intensity
+                                                  LIST(intensity ORDER BY scan_time) AS intensity,
+                                                  LIST(mz_val ORDER BY scan_time) AS mz_arr
                                            FROM complete_data
                                            GROUP BY peak_label, ms_file_label)
-                              SELECT peak_label, ms_file_label, scan_time, intensity, 'ms1' AS ms_type
+                              SELECT peak_label, ms_file_label, scan_time, intensity, mz_arr, 'ms1' AS ms_type
                               FROM agg;
                               """
 
@@ -1465,8 +1893,6 @@ def compute_chromatograms_in_batches(wdir: str,
                         batch_elapsed = time.time() - batch_start if 'batch_start' in locals() else 0
                         failed += batch_count
 
-                        failed += batch_count
-
                         logger.error(f"Error processing batch: {batch_elapsed:>5.2f}s | Error: {str(e)[:80]}")
 
 
@@ -1516,388 +1942,370 @@ def compute_chromatograms_in_batches(wdir: str,
         conn.execute("DROP TABLE IF EXISTS pending_pairs")
 
 
-def compute_chromatograms_optimized(
-        wdir: str,
-        use_for_optimization: bool,
-        checkpoint_every: int = 10,
-        set_progress=None,
-        recompute_ms1: bool = False,
-        recompute_ms2: bool = False,
-        n_cpus=None,
-        ram=None,
-        use_bookmarked: bool = False,
-        # objetivo de “pares pendientes” por ciclo (define dinámicamente cuántos archivos entran)
-        pairs_per_cycle: int = 10_000,
-        # airbag por si cada archivo tiene pocos pares pendientes (p.ej. +1 target)
-        max_files_per_cycle: int = 50,
-):
-    """
-    Versión por “batch de archivos”: cada ciclo ejecuta 1 query que procesa *varios* ms_file_label a la vez
-    (y opcionalmente sub-batches de targets), para que DuckDB tenga suficiente volumen y use threads.
+def populate_full_range_downsampled_chromatograms(wdir: str,
+                                                  n_out: int = FULL_RANGE_DOWNSAMPLE_POINTS,
+                                                  batch_size: int = FULL_RANGE_DOWNSAMPLE_BATCH,
+                                                  set_progress=None,
+                                                  n_cpus=None,
+                                                  ram=None):
+    if _lttbc is None:
+        logger.warning("Full-range downsampling skipped: 'lttbc' is not available.")
+        _send_progress(set_progress, 100, stage="Downsampling", detail="lttbc not available")
+        return
 
-    La query calcula pares pendientes *en el momento de ejecución* (anti-join contra chromatograms), así:
-      - nuevo archivo -> faltan muchos pares (todos los targets) para ese archivo
-      - nuevo target  -> falta ese target para muchos archivos
-    y lo resuelve eficientemente sin computar archivo-por-archivo.
-    """
+    logger.info("Preparing full-range downsampled chromatograms (MS1 only)...")
+    _send_progress(
+        set_progress,
+        0,
+        stage="Downsampling",
+        detail="Preparing full-range downsampled chromatograms",
+    )
 
-    logger.info(f"Computing chromatograms (batch-files). wDir: {wdir}")
+    query_create_scan_lookup = """
+        CREATE TABLE IF NOT EXISTS ms_file_scans AS
+        SELECT DISTINCT ms_file_label,
+               scan_id,
+               scan_time,
+               'ms1' AS ms_type
+        FROM ms1_data
+            UNION ALL
+        SELECT DISTINCT ms_file_label,
+               scan_id,
+               scan_time,
+               'ms2' AS ms_type
+        FROM ms2_data
+        ORDER BY ms_file_label, scan_id, ms_type;
 
-    # === Query: scan lookup ===
-    QUERY_CREATE_SCAN_LOOKUP = """
-                               CREATE TABLE IF NOT EXISTS ms_file_scans AS
-                               SELECT DISTINCT ms_file_label, scan_id, scan_time, 'ms1' AS ms_type
-                               FROM ms1_data
-                               UNION ALL
-                               SELECT DISTINCT ms_file_label, scan_id, scan_time, 'ms2' AS ms_type
-                               FROM ms2_data
-                               ORDER BY ms_file_label, scan_id, ms_type;
+        CREATE INDEX IF NOT EXISTS idx_ms_file_scans_file
+            ON ms_file_scans (ms_file_label);
 
-                               CREATE INDEX IF NOT EXISTS idx_ms_file_scans_file_scan
-                                   ON ms_file_scans (ms_file_label, scan_id, ms_type); \
-                               """
+        CREATE INDEX IF NOT EXISTS idx_ms_file_scans_file_scan
+            ON ms_file_scans (ms_file_label, scan_id, ms_type);
+        """
 
-    # === Batch query MS1: procesa varios archivos a la vez; calcula pares pendientes dentro del SQL ===
-    # Params: [file_labels_list, peak_labels_list, use_bookmarked]
-    QUERY_PROCESS_FILES_MS1 = """
-                              INSERT INTO chromatograms (peak_label, ms_file_label, scan_time, intensity, ms_type)
-                              WITH file_batch AS (SELECT UNNEST(?) ::VARCHAR AS ms_file_label),
-                                   target_filter AS (SELECT peak_label, mz_mean, mz_width, rt_min, rt_max
-                                                     FROM targets t
-                                                     WHERE t.ms_type = 'ms1'
-                                                       AND t.peak_label = ANY(?)
-                                                       AND (t.peak_selection IS TRUE OR NOT EXISTS (SELECT 1
-                                                                                                    FROM targets t1
-                                                                                                    WHERE t1.peak_selection IS TRUE
-                                                                                                      AND t1.ms_type = 'ms1'))
-                                                       AND (CASE WHEN ? THEN t.bookmark IS TRUE ELSE TRUE END)),
-                                   pending_pairs AS (SELECT fb.ms_file_label,
-                                                            tf.peak_label,
-                                                            tf.mz_mean,
-                                                            tf.mz_width,
-                                                            tf.rt_min,
-                                                            tf.rt_max
-                                                     FROM file_batch fb
-                                                              CROSS JOIN target_filter tf
-                                                     WHERE NOT EXISTS (SELECT 1
-                                                                       FROM chromatograms c
-                                                                       WHERE c.ms_type = 'ms1'
-                                                                         AND c.ms_file_label = fb.ms_file_label
-                                                                         AND c.peak_label = tf.peak_label)),
-                                   file_scans AS (SELECT s.ms_file_label, s.scan_id, s.scan_time
-                                                  FROM ms_file_scans s
-                                                           JOIN file_batch fb USING (ms_file_label)
-                                                  WHERE s.ms_type = 'ms1'),
-                                   matched_intensities AS (SELECT pp.peak_label,
-                                                                  pp.ms_file_label,
-                                                                  ms1.scan_id,
-                                                                  MAX(ms1.intensity) AS intensity
-                                                           FROM pending_pairs pp
-                                                                    JOIN ms1_data ms1
-                                                                         ON ms1.ms_file_label = pp.ms_file_label
-                                                                             AND
-                                                                            ms1.mz BETWEEN pp.mz_mean - (pp.mz_mean * pp.mz_width / 1e6)
-                                                                                AND pp.mz_mean + (pp.mz_mean * pp.mz_width / 1e6)
-                                                           GROUP BY pp.peak_label, pp.ms_file_label, ms1.scan_id),
-                                   scans_in_window AS (SELECT pp.peak_label,
-                                                              pp.ms_file_label,
-                                                              fs.scan_id,
-                                                              fs.scan_time
-                                                       FROM pending_pairs pp
-                                                                JOIN file_scans fs
-                                                                     ON fs.ms_file_label = pp.ms_file_label
-                                                                         AND
-                                                                        fs.scan_time BETWEEN COALESCE(pp.rt_min, 0) - 30
-                                                                            AND COALESCE(pp.rt_max, 999999) + 30),
-                                   complete_data AS (SELECT sw.peak_label,
-                                                            sw.ms_file_label,
-                                                            sw.scan_time,
-                                                            COALESCE(ROUND(mi.intensity, 0), 1) AS intensity
-                                                     FROM scans_in_window sw
-                                                              LEFT JOIN matched_intensities mi
-                                                                        ON sw.peak_label = mi.peak_label
-                                                                            AND sw.ms_file_label = mi.ms_file_label
-                                                                            AND sw.scan_id = mi.scan_id)
-                              SELECT peak_label,
-                                     ms_file_label,
-                                     LIST(scan_time ORDER BY scan_time) AS scan_time,
-                                     LIST(intensity ORDER BY scan_time) AS intensity,
-                                     'ms1'                              AS ms_type
-                              FROM complete_data
-                              GROUP BY peak_label, ms_file_label; \
-                              """
+    query_create_pending = """
+        CREATE TABLE IF NOT EXISTS pending_full_ds_pairs AS
+        SELECT
+            ROW_NUMBER() OVER () AS pair_id,
+            c.peak_label,
+            c.ms_file_label,
+            t.mz_mean,
+            t.mz_width
+        FROM chromatograms c
+        JOIN targets t ON c.peak_label = t.peak_label
+        WHERE c.ms_type = 'ms1'
+          AND c.scan_time_full_ds IS NULL
+          AND t.mz_mean IS NOT NULL
+          AND t.mz_width IS NOT NULL
+        ORDER BY c.ms_file_label, c.peak_label;
+        """
 
-    # === Batch query MS2: idem ===
-    # Params: [file_labels_list, peak_labels_list, use_bookmarked]
-    QUERY_PROCESS_FILES_MS2 = """
-                              INSERT INTO chromatograms (peak_label, ms_file_label, scan_time, intensity, ms_type)
-                              WITH file_batch AS (SELECT UNNEST(?) ::VARCHAR AS ms_file_label),
-                                   target_filter AS (SELECT peak_label, filterLine, rt_min, rt_max
-                                                     FROM targets t
-                                                     WHERE t.ms_type = 'ms2'
-                                                       AND t.peak_label = ANY(?)
-                                                       AND (t.peak_selection IS TRUE OR NOT EXISTS (SELECT 1
-                                                                                                    FROM targets t1
-                                                                                                    WHERE t1.peak_selection IS TRUE
-                                                                                                      AND t1.ms_type = 'ms2'))
-                                                       AND (CASE WHEN ? THEN t.bookmark IS TRUE ELSE TRUE END)),
-                                   pending_pairs AS (SELECT fb.ms_file_label,
-                                                            tf.peak_label,
-                                                            tf.filterLine,
-                                                            tf.rt_min,
-                                                            tf.rt_max
-                                                     FROM file_batch fb
-                                                              CROSS JOIN target_filter tf
-                                                     WHERE NOT EXISTS (SELECT 1
-                                                                       FROM chromatograms c
-                                                                       WHERE c.ms_type = 'ms2'
-                                                                         AND c.ms_file_label = fb.ms_file_label
-                                                                         AND c.peak_label = tf.peak_label)),
-                                   file_scans AS (SELECT s.ms_file_label, s.scan_id, s.scan_time
-                                                  FROM ms_file_scans s
-                                                           JOIN file_batch fb USING (ms_file_label)
-                                                  WHERE s.ms_type = 'ms2'),
-                                   matched_intensities AS (SELECT pp.peak_label,
-                                                                  pp.ms_file_label,
-                                                                  ms2.scan_id,
-                                                                  ms2.intensity
-                                                           FROM pending_pairs pp
-                                                                    JOIN ms2_data ms2
-                                                                         ON ms2.ms_file_label = pp.ms_file_label
-                                                                             AND ms2.filterLine = pp.filterLine),
-                                   scans_in_window AS (SELECT pp.peak_label,
-                                                              pp.ms_file_label,
-                                                              fs.scan_id,
-                                                              fs.scan_time
-                                                       FROM pending_pairs pp
-                                                                JOIN file_scans fs
-                                                                     ON fs.ms_file_label = pp.ms_file_label
-                                                                         AND
-                                                                        fs.scan_time BETWEEN COALESCE(pp.rt_min, 0) - 30
-                                                                            AND COALESCE(pp.rt_max, 999999) + 30),
-                                   complete_data AS (SELECT sw.peak_label,
-                                                            sw.ms_file_label,
-                                                            sw.scan_time,
-                                                            COALESCE(ROUND(mi.intensity, 0), 1) AS intensity
-                                                     FROM scans_in_window sw
-                                                              LEFT JOIN matched_intensities mi
-                                                                        ON sw.peak_label = mi.peak_label
-                                                                            AND sw.ms_file_label = mi.ms_file_label
-                                                                            AND sw.scan_id = mi.scan_id)
-                              SELECT peak_label,
-                                     ms_file_label,
-                                     LIST(scan_time ORDER BY scan_time) AS scan_time,
-                                     LIST(intensity ORDER BY scan_time) AS intensity,
-                                     'ms2'                              AS ms_type
-                              FROM complete_data
-                              GROUP BY peak_label, ms_file_label; \
-                              """
+    query_batch_full_range = """
+        WITH batch_pairs AS (
+            SELECT peak_label, ms_file_label, mz_mean, mz_width
+            FROM pending_full_ds_pairs
+            WHERE pair_id BETWEEN ? AND ?
+        ),
+        matched_with_mz AS (
+            SELECT
+                bp.peak_label,
+                bp.ms_file_label,
+                ms1.scan_id,
+                ms1.intensity,
+                ROW_NUMBER() OVER (
+                    PARTITION BY bp.peak_label, bp.ms_file_label, ms1.scan_id
+                    ORDER BY ms1.intensity DESC
+                ) AS rn
+            FROM batch_pairs bp
+            JOIN ms1_data ms1
+                ON ms1.ms_file_label = bp.ms_file_label
+                AND ms1.mz BETWEEN
+                    bp.mz_mean - (bp.mz_mean * bp.mz_width / 1e6)
+                    AND bp.mz_mean + (bp.mz_mean * bp.mz_width / 1e6)
+        ),
+        matched_intensities AS (
+            SELECT peak_label, ms_file_label, scan_id, intensity
+            FROM matched_with_mz
+            WHERE rn = 1
+        ),
+        all_scans AS (
+            SELECT
+                bp.peak_label,
+                bp.ms_file_label,
+                s.scan_id,
+                s.scan_time
+            FROM batch_pairs bp
+            JOIN ms_file_scans s
+                ON s.ms_file_label = bp.ms_file_label
+                AND s.ms_type = 'ms1'
+        ),
+        complete_data AS (
+            SELECT
+                a.peak_label,
+                a.ms_file_label,
+                a.scan_time,
+                COALESCE(ROUND(m.intensity, 0), 1) AS intensity
+            FROM all_scans a
+            LEFT JOIN matched_intensities m
+                ON a.peak_label = m.peak_label
+                AND a.ms_file_label = m.ms_file_label
+                AND a.scan_id = m.scan_id
+        ),
+        agg AS (
+            SELECT
+                peak_label,
+                ms_file_label,
+                LIST(scan_time ORDER BY scan_time) AS scan_time,
+                LIST(intensity ORDER BY scan_time) AS intensity
+            FROM complete_data
+            GROUP BY peak_label, ms_file_label
+        )
+        SELECT peak_label, ms_file_label, scan_time, intensity
+        FROM agg;
+        """
 
-    # === Pending work (para armar ciclos por pares pendientes) ===
-    QUERY_GET_PENDING = """
-                        WITH target_filter AS (SELECT peak_label, ms_type
-                                               FROM targets t
-                                               WHERE (t.peak_selection IS TRUE OR NOT EXISTS (SELECT 1
-                                                                                              FROM targets t1
-                                                                                              WHERE t1.peak_selection IS TRUE
-                                                                                                AND t1.ms_type = t.ms_type))
-                                                 AND (CASE WHEN ? THEN t.bookmark IS TRUE ELSE TRUE END)),
-                             sample_filter AS (SELECT ms_file_label
-                                               FROM samples
-                                               WHERE (CASE WHEN ? THEN use_for_optimization ELSE use_for_processing END) = TRUE),
-                             existing_pairs AS (SELECT DISTINCT peak_label, ms_file_label, ms_type
-                                                FROM chromatograms)
-                        SELECT ms_type,
-                               ms_file_label,
-                               LIST(peak_label) AS peak_labels,
-                               COUNT(*)         AS pair_count
-                        FROM (SELECT t.peak_label, s.ms_file_label, t.ms_type
-                              FROM target_filter t
-                                       CROSS JOIN sample_filter s
-                              WHERE NOT EXISTS (SELECT 1
-                                                FROM existing_pairs e
-                                                WHERE e.peak_label = t.peak_label
-                                                  AND e.ms_file_label = s.ms_file_label
-                                                  AND e.ms_type = t.ms_type))
-                        GROUP BY ms_type, ms_file_label
-                        ORDER BY ms_type, ms_file_label; \
-                        """
-
-    # === Cleanup inicial ===
-    if recompute_ms1:
-        logger.info("Deleting existing MS1 chromatograms...")
-        with duckdb_connection(wdir, n_cpus=n_cpus, ram=ram) as con:
-            con.execute("DELETE FROM chromatograms WHERE ms_type = 'ms1'")
-            con.execute("CHECKPOINT")
-
-    if recompute_ms2:
-        logger.info("Deleting existing MS2 chromatograms...")
-        with duckdb_connection(wdir, n_cpus=n_cpus, ram=ram) as con:
-            con.execute("DELETE FROM chromatograms WHERE ms_type = 'ms2'")
-            con.execute("CHECKPOINT")
-
-    # === Crear scan lookup ===
+    created_lookup = False
     with duckdb_connection(wdir, n_cpus=n_cpus, ram=ram) as conn:
-        conn.execute("CHECKPOINT")
         try:
-            _ = conn.execute("SELECT 1 FROM ms_file_scans LIMIT 1").fetchone()
+            conn.execute("SELECT COUNT(*) FROM ms_file_scans").fetchone()
         except Exception:
-            logger.info("Creating scan lookup table...")
-            t0 = time.perf_counter()
-            conn.execute(QUERY_CREATE_SCAN_LOOKUP)
-            conn.execute("CHECKPOINT")
-            logger.info(f"Scan lookup created in {time.perf_counter() - t0:.2f}s")
+            logger.info("Creating scan lookup table for full-range downsampling...")
+            conn.execute(query_create_scan_lookup)
+            created_lookup = True
 
-    # Limitar targets por sub-batch (para evitar explosión de intermedios cuando el batch de files es grande)
-    max_targets_per_batch = recommend_max_targets(available_ram_gb=ram, safety_factor=0.95)
+        conn.execute("DROP TABLE IF EXISTS pending_full_ds_pairs")
+        conn.execute(query_create_pending)
 
-    # === Obtener pending ===
-    with duckdb_connection(wdir, n_cpus=n_cpus, ram=ram) as conn:
-        logger.info("Getting pending work...")
-        pending = conn.execute(QUERY_GET_PENDING, [use_bookmarked, use_for_optimization]).fetchall()
+        total_pairs = conn.execute(
+            "SELECT COUNT(*) FROM pending_full_ds_pairs"
+        ).fetchone()[0]
 
-    if not pending:
-        logger.info("No pending work")
-        return {'total_pairs': 0, 'processed': 0, 'failed': 0, 'batches': 0}
+        if not total_pairs:
+            logger.info("No full-range downsampled chromatograms to compute.")
+            conn.execute("DROP TABLE IF EXISTS pending_full_ds_pairs")
+            if created_lookup:
+                conn.execute("DROP TABLE IF EXISTS ms_file_scans")
+            _send_progress(set_progress, 100, stage="Downsampling", detail="No pending pairs")
+            return
 
-    total_pairs = sum(row[3] for row in pending)
-    total_files = len(pending)
-    logger.info(f"{total_pairs:,} pending pairs across {total_files} file-type combinations")
+        total_batches = (total_pairs + batch_size - 1) // batch_size
+        logger.info(f"Downsampling {total_pairs:,} MS1 chromatograms in {total_batches} batches...")
 
-    def _take_cycle(pending_rows, start_i):
-        """Selecciona un ciclo sin mezclar ms_type, hasta alcanzar pairs_per_cycle o max_files_per_cycle."""
-        ms_type0 = pending_rows[start_i][0]
-        files = []
-        peaks = set()
-        pairs = 0
-        i = start_i
+        for batch_idx in range(total_batches):
+            start_id = batch_idx * batch_size + 1
+            end_id = min((batch_idx + 1) * batch_size, total_pairs)
 
-        while i < len(pending_rows):
-            ms_type, ms_file_label, peak_labels_list, pair_count = pending_rows[i]
-            if ms_type != ms_type0:
-                break
-
-            files.append(ms_file_label)
-            peaks.update(peak_labels_list)
-            pairs += pair_count
-            i += 1
-
-            if pairs >= pairs_per_cycle or len(files) >= max_files_per_cycle:
-                break
-
-        return ms_type0, files, list(peaks), pairs, i
-
-    processed_est = 0
-    failed = 0
-    cycles = 0
-    cycles_since_checkpoint = 0
-
-    # === Ejecutar (1 conexión) ===
-    with duckdb_connection(wdir, n_cpus=n_cpus, ram=ram) as conn:
-        conn.execute("CHECKPOINT")
-        conn.execute("BEGIN TRANSACTION")
-
-        i = 0
-        cycle_id = 1
-
-        while i < len(pending):
-            ms_type, file_batch, peak_batch, cycle_pairs, next_i = _take_cycle(pending, i)
-
-            # Sub-batching de targets si el set es grande (sigue siendo 1 query por sub-batch, no por archivo)
-            peak_batch = list(peak_batch)
-            num_target_sub = (len(peak_batch) + max_targets_per_batch - 1) // max_targets_per_batch
-
-            logger.info(
-                f"Cycle {cycle_id}: {ms_type.upper()} | "
-                f"{len(file_batch)} files | ~{cycle_pairs:,} pending pairs | "
-                f"{len(peak_batch)} targets | target_sub_batches={num_target_sub}"
-            )
-
-            t_cycle = time.time()
-            for sb in range(num_target_sub):
-                t0 = sb * max_targets_per_batch
-                t1 = min(t0 + max_targets_per_batch, len(peak_batch))
-                sb_peaks = peak_batch[t0:t1]
-
-                t_sb = time.time()
-                if ms_type == "ms1":
-                    conn.execute(QUERY_PROCESS_FILES_MS1, [file_batch, sb_peaks, use_bookmarked])
-                else:
-                    conn.execute(QUERY_PROCESS_FILES_MS2, [file_batch, sb_peaks, use_bookmarked])
-                sb_dt = time.time() - t_sb
-
-                logger.info(
-                    f"  - Target sub-batch {sb + 1}/{num_target_sub}: {len(sb_peaks)} targets | {sb_dt:.2f}s"
+            rows = conn.execute(query_batch_full_range, [start_id, end_id]).fetchall()
+            updates = []
+            for peak_label, ms_file_label, scan_time, intensity in rows:
+                if scan_time is None or intensity is None:
+                    continue
+                smoothed = _apply_savgol_smoothing(intensity)
+                down_x, down_y = _apply_lttb_downsampling(scan_time, smoothed, n_out=n_out)
+                if len(down_x) > n_out and len(scan_time) > n_out:
+                    logger.warning(
+                        "Downsampling failed for %s/%s (points=%d, n_out=%d)",
+                        peak_label,
+                        ms_file_label,
+                        len(scan_time),
+                        n_out,
+                    )
+                    continue
+                updates.append(
+                    (list(down_x), list(down_y), peak_label, ms_file_label)
                 )
 
-            cycle_dt = time.time() - t_cycle
-
-            # progreso estimado con snapshot de pending (en la práctica coincide salvo cambios concurrentes)
-            processed_est += cycle_pairs
-            cycles += 1
-            cycles_since_checkpoint += 1
-
-            logger.info(
-                f"Cycle {cycle_id} done in {cycle_dt:.2f}s | "
-                f"Progress(est): {processed_est:,}/{total_pairs:,} ({100 * processed_est / total_pairs:.1f}%)"
-            )
-
-            if set_progress:
-                progress_pct = (processed_est / total_pairs) * 100
-                _send_progress(
-                    set_progress,
-                    round(progress_pct, 1),
-                    stage="Chromatograms",
-                    detail=f"{ms_type.upper()} | {processed_est:,}/{total_pairs:,} pairs"
+            if updates:
+                conn.executemany(
+                    """
+                    UPDATE chromatograms
+                    SET scan_time_full_ds = ?, intensity_full_ds = ?
+                    WHERE peak_label = ? AND ms_file_label = ?
+                    """,
+                    updates,
                 )
 
-            # checkpoint/commit por ciclos (igual idea que antes, pero ahora “batch” = ciclo)
-            if checkpoint_every and cycles_since_checkpoint >= checkpoint_every:
-                conn.execute("COMMIT")
-                conn.execute("CHECKPOINT")
-                conn.execute("BEGIN TRANSACTION")
-                cycles_since_checkpoint = 0
+            progress_pct = round((end_id / total_pairs) * 100, 1)
+            _send_progress(
+                set_progress,
+                progress_pct,
+                stage="Downsampling",
+                detail=f"Batch {batch_idx + 1}/{total_batches}",
+            )
 
-            i = next_i
-            cycle_id += 1
+        conn.execute("DROP TABLE IF EXISTS pending_full_ds_pairs")
+        if created_lookup:
+            conn.execute("DROP TABLE IF EXISTS ms_file_scans")
 
-        conn.execute("COMMIT")
-        conn.execute("CHECKPOINT")
-
-    logger.info(f"Complete: ~{processed_est:,} processed(est), {failed:,} failed, {cycles} cycles")
-
-    return {
-        'total_pairs': total_pairs,
-        'processed': processed_est,  # estimado (basado en pending snapshot)
-        'failed': failed,
-        'batches': cycles
-    }
+    _send_progress(set_progress, 100, stage="Downsampling", detail="Done")
+    logger.info("Full-range downsampled chromatograms computed.")
 
 
+def populate_full_range_downsampled_chromatograms_for_target(wdir: str | None,
+                                                             peak_label: str,
+                                                             n_out: int = FULL_RANGE_DOWNSAMPLE_POINTS,
+                                                             n_cpus=None,
+                                                             ram=None,
+                                                             conn: duckdb.DuckDBPyConnection | None = None) -> bool:
+    if _lttbc is None:
+        logger.warning("On-demand downsampling skipped: 'lttbc' is not available.")
+        return False
 
-def recommend_max_targets(available_ram_gb: int,
-                          avg_scans_per_file: int = 500,
-                          safety_factor: float = 0.5) -> int:
-    """
-    Recomienda max_targets_per_batch basado en RAM disponible.
+    query_create_scan_lookup = """
+        CREATE TABLE IF NOT EXISTS ms_file_scans AS
+        SELECT DISTINCT ms_file_label,
+               scan_id,
+               scan_time,
+               'ms1' AS ms_type
+        FROM ms1_data
+            UNION ALL
+        SELECT DISTINCT ms_file_label,
+               scan_id,
+               scan_time,
+               'ms2' AS ms_type
+        FROM ms2_data
+        ORDER BY ms_file_label, scan_id, ms_type;
 
-    Args:
-        available_ram_gb: RAM disponible en GB
-        avg_scans_per_file: Promedio de scans por archivo
-        safety_factor: Factor de seguridad (0.5 = usar solo 50% de RAM)
+        CREATE INDEX IF NOT EXISTS idx_ms_file_scans_file
+            ON ms_file_scans (ms_file_label);
 
-    Returns:
-        Número recomendado de targets por batch
-    """
-    available_ram_mb = available_ram_gb * 1024 * safety_factor
+        CREATE INDEX IF NOT EXISTS idx_ms_file_scans_file_scan
+            ON ms_file_scans (ms_file_label, scan_id, ms_type);
+        """
 
-    # RAM por target ≈ scans × 30 bytes
-    ram_per_target_mb = (avg_scans_per_file * 30) / (1024 * 1024)
+    query_full_range = """
+        WITH target AS (
+            SELECT ?::DOUBLE AS mz_mean, ?::DOUBLE AS mz_width
+        ),
+        samples AS (
+            SELECT DISTINCT ms_file_label
+            FROM chromatograms
+            WHERE peak_label = ?
+              AND ms_type = 'ms1'
+              AND scan_time_full_ds IS NULL
+        ),
+        matched_with_mz AS (
+            SELECT
+                s.ms_file_label,
+                ms1.scan_id,
+                ms1.intensity,
+                ROW_NUMBER() OVER (
+                    PARTITION BY s.ms_file_label, ms1.scan_id
+                    ORDER BY ms1.intensity DESC
+                ) AS rn
+            FROM samples s
+            JOIN ms1_data ms1
+                ON ms1.ms_file_label = s.ms_file_label
+                AND ms1.mz BETWEEN
+                    (SELECT mz_mean FROM target) - ((SELECT mz_mean FROM target) * (SELECT mz_width FROM target) / 1e6)
+                    AND (SELECT mz_mean FROM target) + ((SELECT mz_mean FROM target) * (SELECT mz_width FROM target) / 1e6)
+        ),
+        matched_intensities AS (
+            SELECT ms_file_label, scan_id, intensity
+            FROM matched_with_mz
+            WHERE rn = 1
+        ),
+        all_scans AS (
+            SELECT
+                s.ms_file_label,
+                sc.scan_id,
+                sc.scan_time
+            FROM samples s
+            JOIN ms_file_scans sc
+                ON sc.ms_file_label = s.ms_file_label
+                AND sc.ms_type = 'ms1'
+        ),
+        complete_data AS (
+            SELECT
+                a.ms_file_label,
+                a.scan_time,
+                COALESCE(ROUND(m.intensity, 0), 1) AS intensity
+            FROM all_scans a
+            LEFT JOIN matched_intensities m
+                ON a.ms_file_label = m.ms_file_label
+                AND a.scan_id = m.scan_id
+        ),
+        agg AS (
+            SELECT
+                ms_file_label,
+                LIST(scan_time ORDER BY scan_time) AS scan_time,
+                LIST(intensity ORDER BY scan_time) AS intensity
+            FROM complete_data
+            GROUP BY ms_file_label
+        )
+        SELECT ms_file_label, scan_time, intensity
+        FROM agg;
+        """
 
-    max_targets = int(available_ram_mb / ram_per_target_mb)
+    connection_ctx = None
+    if conn is None:
+        if wdir is None:
+            return False
+        connection_ctx = duckdb_connection(wdir, n_cpus=n_cpus, ram=ram)
+        conn = connection_ctx.__enter__()
+        if conn is None:
+            return False
+    try:
+        target = conn.execute(
+            """
+            SELECT mz_mean, mz_width
+            FROM targets
+            WHERE peak_label = ?
+              AND mz_mean IS NOT NULL
+              AND mz_width IS NOT NULL
+            """,
+            [peak_label],
+        ).fetchone()
+        if not target:
+            return False
 
-    # Mínimo 10, máximo 200
-    return max(10, min(10000, max_targets))
+        missing = conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM chromatograms
+            WHERE peak_label = ?
+              AND ms_type = 'ms1'
+              AND scan_time_full_ds IS NULL
+            """,
+            [peak_label],
+        ).fetchone()[0]
+        if not missing:
+            return True
+
+        created_lookup = False
+        try:
+            conn.execute("SELECT COUNT(*) FROM ms_file_scans").fetchone()
+        except Exception:
+            conn.execute(query_create_scan_lookup)
+            created_lookup = True
+
+        logger.info("On-demand downsampling for target %s (%d chromatograms)", peak_label, missing)
+        rows = conn.execute(query_full_range, [target[0], target[1], peak_label]).fetchall()
+        updates = []
+        for ms_file_label, scan_time, intensity in rows:
+            if scan_time is None or intensity is None:
+                continue
+            smoothed = _apply_savgol_smoothing(intensity)
+            down_x, down_y = _apply_lttb_downsampling(scan_time, smoothed, n_out=n_out)
+            updates.append((list(down_x), list(down_y), peak_label, ms_file_label))
+
+        if updates:
+            conn.executemany(
+                """
+                UPDATE chromatograms
+                SET scan_time_full_ds = ?, intensity_full_ds = ?
+                WHERE peak_label = ? AND ms_file_label = ?
+                """,
+                updates,
+            )
+
+        if created_lookup:
+            conn.execute("DROP TABLE IF EXISTS ms_file_scans")
+    finally:
+        if connection_ctx is not None:
+            connection_ctx.__exit__(None, None, None)
+
+    return True
 
 
 def compute_results_in_batches(wdir: str,
@@ -1938,24 +2346,41 @@ def compute_results_in_batches(wdir: str,
                     list_transform(pairs, p -> p.i) AS intensity_arr
                 FROM filtered
             ),
+            -- Compute trapezoid integration for peak_area
+            -- Trapezoid rule: Area = Σ (y[i] + y[i+1])/2 × (x[i+1] - x[i])
+            trapezoid AS (
+                SELECT
+                    scan_time_arr,
+                    intensity_arr,
+                    -- Build list of trapezoid areas for each segment
+                    list_transform(
+                        range(1, len(scan_time_arr)),
+                        i -> (
+                            (list_extract(intensity_arr, i) + list_extract(intensity_arr, i + 1)) / 2.0
+                            * (list_extract(scan_time_arr, i + 1) - list_extract(scan_time_arr, i))
+                        )
+                    ) AS trapezoid_areas
+                FROM arrays
+                -- Removed: WHERE len(intensity_arr) > 0
+            ),
             -- Compute all metrics from arrays
             metrics AS (
                 SELECT
                     len(intensity_arr) AS peak_n_datapoints,
-                    ROUND(list_sum(intensity_arr), 0) AS peak_area,
-                    ROUND(list_max(intensity_arr), 0) AS peak_max,
-                    ROUND(list_min(intensity_arr), 0) AS peak_min,
-                    ROUND(list_avg(intensity_arr), 0) AS peak_mean,
-                    -- Median: sorted list at middle index
-                    ROUND(list_sort(intensity_arr)[CAST(len(intensity_arr) / 2 + 1 AS BIGINT)], 0) AS peak_median,
+                    -- Trapezoid integration
+                    ROUND(COALESCE(list_sum(trapezoid_areas), 0), 0) AS peak_area,
+                    ROUND(COALESCE(list_max(intensity_arr), 0), 0) AS peak_max,
+                    ROUND(COALESCE(list_min(intensity_arr), 0), 0) AS peak_min,
+                    ROUND(COALESCE(list_avg(intensity_arr), 0), 0) AS peak_mean,
+                    -- Median: handle empty list case
+                    ROUND(COALESCE(list_sort(intensity_arr)[CAST(len(intensity_arr) / 2 + 1 AS BIGINT)], 0), 0) AS peak_median,
                     -- RT of max intensity
                     scan_time_arr[CAST(list_position(intensity_arr, list_max(intensity_arr)) AS BIGINT)] AS peak_rt_of_max,
                     -- Index of max for top3 calculation
                     CAST(list_position(intensity_arr, list_max(intensity_arr)) AS BIGINT) AS max_idx,
                     scan_time_arr,
                     intensity_arr
-                FROM arrays
-                WHERE len(intensity_arr) > 0
+                FROM trapezoid
             )
             -- Final output with peak_area_top3
             SELECT
@@ -2018,6 +2443,7 @@ def compute_results_in_batches(wdir: str,
             peak_min,
             peak_mean,
             peak_rt_of_max,
+            peak_mz_of_max,
             peak_median,
             peak_n_datapoints,
             rt_aligned,
@@ -2037,6 +2463,7 @@ def compute_results_in_batches(wdir: str,
                 c.ms_file_label,
                 c.scan_time,
                 c.intensity,
+                c.mz_arr,
                 t.rt_min,
                 t.rt_max,
                 COALESCE(t.rt_align_enabled, FALSE) AS rt_align_enabled,
@@ -2062,6 +2489,12 @@ def compute_results_in_batches(wdir: str,
             m.peak_min,
             m.peak_mean,
             m.peak_rt_of_max,
+            -- peak_mz_of_max: Get mz at same index as peak max intensity
+            CASE 
+                WHEN pd.mz_arr IS NOT NULL AND list_position(pd.intensity, m.peak_max) IS NOT NULL
+                THEN pd.mz_arr[CAST(list_position(pd.intensity, m.peak_max) AS BIGINT)]
+                ELSE NULL
+            END AS peak_mz_of_max,
             m.peak_median,
             m.peak_n_datapoints,
             pd.rt_align_enabled AS rt_aligned,
@@ -2284,6 +2717,243 @@ def compute_results_in_batches(wdir: str,
         'batches': batches
     }
 
+
+def compute_fitted_results(
+    wdir: str,
+    use_bookmarked: bool = False,
+    recompute: bool = False,
+    n_workers: int = 8,
+    set_progress=None,
+    n_cpus=None,
+    ram=None
+) -> dict:
+    """
+    Compute EMG peak fitting for all results.
+    
+    This function:
+    1. Queries existing results with chromatogram data
+    2. Fits EMG model to each peak using parallel processing
+    3. Updates results table with fitted metrics
+    
+    Parameters:
+        wdir: Working directory path
+        use_bookmarked: Only process bookmarked targets
+        recompute: Recompute even if fitting was already done
+        n_workers: Number of parallel workers (default 8)
+        set_progress: Progress callback function
+        n_cpus: CPU cores for DuckDB
+        ram: RAM allocation for DuckDB
+    
+    Returns:
+        Dictionary with processing statistics
+    """
+    from .peak_fitting import fit_peaks_batch
+    
+    _send_progress(set_progress, 0, stage="Peak Fitting", detail="Preparing data...")
+    
+    # Query results that need fitting
+    with duckdb_connection(wdir, n_cpus=n_cpus, ram=ram) as conn:
+        # Build query to get peaks needing fitting
+        where_conditions = []
+        if use_bookmarked:
+            where_conditions.append(
+                "r.peak_label IN (SELECT peak_label FROM targets WHERE bookmark = TRUE)"
+            )
+        if not recompute:
+            where_conditions.append("(r.fit_success IS NULL OR r.fit_success = FALSE)")
+        
+        where_clause = f"WHERE {' AND '.join(where_conditions)}" if where_conditions else ""
+        
+        # Get chromatogram data for fitting
+        query = f"""
+            SELECT 
+                r.peak_label,
+                r.ms_file_label,
+                r.scan_time,
+                r.intensity,
+                t.rt
+            FROM results r
+            JOIN targets t ON r.peak_label = t.peak_label
+            {where_clause}
+        """
+        
+        data = conn.execute(query).fetchall()
+        
+    if not data:
+        logger.info("No peaks require fitting")
+        _send_progress(set_progress, 100, stage="Peak Fitting", detail="No peaks to fit")
+        return {'total': 0, 'fitted': 0, 'failed': 0}
+    
+    total_peaks = len(data)
+    logger.info(f"Fitting {total_peaks:,} peaks with {n_workers} workers...")
+    
+    _send_progress(
+        set_progress, 
+        5, 
+        stage="Peak Fitting", 
+        detail=f"Fitting {total_peaks:,} peaks..."
+    )
+    
+    # Prepare data for parallel processing
+    # Format: (peak_label, ms_file_label, scan_time, intensity, expected_rt)
+    peaks_data = [
+        (row[0], row[1], row[2], row[3], row[4])
+        for row in data
+    ]
+    
+    # Progress callback for fitting - maps to 5-80% of progress bar
+    batch_start_time = [time.time()]  # Start of current batch
+    last_batch_duration = [0.0]       # Duration of last completed batch
+    last_logged_batch = [0]
+    batch_size = max(100, total_peaks // 20)  # ~20 batches or 100 peaks minimum
+    
+    def fitting_progress(completed, total, rate):
+        # Map fitting progress (0-100%) to UI progress (5-80%)
+        fit_pct = (completed / total) * 100 if total > 0 else 0
+        ui_pct = 5 + (fit_pct * 0.75)  # 5% + up to 75% = 80% max
+        
+        # Calculate batch info
+        current_batch_idx = (completed - 1) // batch_size
+        batch_num = current_batch_idx + 1
+        total_batches = (total + batch_size - 1) // batch_size
+        
+        current_time = time.time()
+        
+        # Check if we moved to a new batch (or finished)
+        if batch_num > last_logged_batch[0] or completed == total:
+            duration = current_time - batch_start_time[0]
+            last_batch_duration[0] = duration
+            
+            logger.info(
+                f"Batch {batch_num:4}/{total_batches} | "
+                f"Peaks {completed:6,}/{total:,} | "
+                f"Batch time: {duration:5.2f}s | "
+                f"Rate: {rate:.0f}/sec"
+            )
+            
+            # Prepare for next batch
+            if completed < total:
+                batch_start_time[0] = current_time
+                last_logged_batch[0] = batch_num
+        
+        # Display time: Use last batch duration for stability, or current elapsed for batch 1
+        display_time = last_batch_duration[0] if batch_num > 1 else (current_time - batch_start_time[0])
+        
+        # Consistent format for UI: "Batch X/Y | Progress X/Y | Time/batch Zs"
+        detail = f"Batch {batch_num}/{total_batches} | Progress {completed:,}/{total:,} | Time/batch {display_time:.2f}s"
+        
+        _send_progress(set_progress, round(ui_pct, 1), stage="Peak Fitting", detail=detail)
+    
+    # Run parallel fitting with progress updates
+    start_time = time.time()
+    fit_results = fit_peaks_batch(peaks_data, n_workers=n_workers, progress_callback=fitting_progress)
+    elapsed = time.time() - start_time
+    
+    logger.info(f"Fitting completed in {elapsed:.2f}s ({total_peaks/elapsed:.0f} peaks/sec)")
+    
+    _send_progress(
+        set_progress, 
+        80, 
+        stage="Peak Fitting", 
+        detail=f"Updating database..."
+    )
+    
+    # Update database with fit results in batches for progress tracking
+    fitted_count = 0
+    failed_count = 0
+    total_results = len(fit_results)
+    update_batch_size = max(100, total_results // 10)  # ~10 updates
+    db_start_time = time.time()
+    last_db_batch_time = time.time()
+    last_db_duration = 0.0
+    
+    with duckdb_connection(wdir, n_cpus=n_cpus, ram=ram) as conn:
+        conn.execute("BEGIN TRANSACTION")
+        
+        for i, result in enumerate(fit_results):
+            try:
+                conn.execute("""
+                    UPDATE results
+                    SET peak_area_fitted = ?,
+                        peak_sigma = ?,
+                        peak_tau = ?,
+                        peak_asymmetry = ?,
+                        peak_rt_fitted = ?,
+                        fit_r_squared = ?,
+                        fit_success = ?
+                    WHERE peak_label = ? AND ms_file_label = ?
+                """, [
+                    result['peak_area_fitted'],
+                    result['peak_sigma'],
+                    result['peak_tau'],
+                    result['peak_asymmetry'],
+                    result['peak_rt_fitted'],
+                    result['fit_r_squared'],
+                    result['fit_success'],
+                    result['peak_label'],
+                    result['ms_file_label'],
+                ])
+                
+                if result['fit_success']:
+                    fitted_count += 1
+                else:
+                    failed_count += 1
+                    
+            except Exception as e:
+                logger.error(f"Failed to update {result['peak_label']}: {e}")
+                failed_count += 1
+            
+            # Progress update every batch
+            if (i + 1) % update_batch_size == 0 or (i + 1) == total_results:
+                # Map progress from 80-98%
+                db_pct = ((i + 1) / total_results) * 18  # 18% range for DB updates
+                ui_pct = 80 + db_pct
+                
+                current_time = time.time()
+                batch_duration = current_time - last_db_batch_time
+                last_db_duration = batch_duration
+                last_db_batch_time = current_time
+                
+                db_elapsed = current_time - db_start_time
+                rate = (i + 1) / db_elapsed if db_elapsed > 0 else 0
+                batch_num = (i + 1) // update_batch_size
+                total_batches = (total_results // update_batch_size) + (1 if total_results % update_batch_size else 0)
+                
+                # Consistent format for UI: "Batch X/Y | Progress X/Y | Time/batch Zs"
+                detail = f"Batch {batch_num}/{total_batches} | Progress {i+1:,}/{total_results:,} | Time/batch {batch_duration:.2f}s"
+                
+                logger.info(
+                    f"Batch {batch_num:4}/{total_batches} | "
+                    f"Rows {i+1:6,}/{total_results:,} | "
+                    f"Batch time: {batch_duration:5.2f}s | "
+                    f"Progress {i+1:,}/{total_results:,}"
+                )
+                _send_progress(set_progress, round(ui_pct, 1), stage="Peak Fitting", detail=detail)
+        
+        conn.execute("COMMIT")
+        conn.execute("CHECKPOINT")
+    
+    _send_progress(
+        set_progress, 
+        100, 
+        stage="Peak Fitting", 
+        detail=f"Fitted {fitted_count:,} peaks"
+    )
+    
+    total_elapsed = time.time() - start_time
+    logger.info(
+        f"Peak fitting complete. "
+        f"Total: {total_peaks:,}, Fitted: {fitted_count:,}, Failed: {failed_count:,}"
+    )
+    
+    return {
+        'total': total_peaks,
+        'fitted': fitted_count,
+        'failed': failed_count,
+        'elapsed_seconds': total_elapsed
+    }
+
+
 def compute_peak_properties(con: duckdb.DuckDBPyConnection,
                             set_progress=None,
                             recompute=False,
@@ -2348,18 +3018,35 @@ def compute_peak_properties(con: duckdb.DuckDBPyConnection,
                                     FROM unnested u
                                              JOIN targets t ON u.peak_label = t.peak_label
                                     WHERE u.scan_time BETWEEN t.rt_min AND t.rt_max),
+-- Compute trapezoid segments for each consecutive pair of points
+                 trapezoid_segments AS (
+                     SELECT peak_label,
+                            ms_file_label,
+                            scan_time,
+                            intensity,
+                            -- Trapezoid area for segment [i, i+1]: (y[i] + y[i+1])/2 * (x[i+1] - x[i])
+                            CASE 
+                                WHEN LEAD(scan_time) OVER w IS NOT NULL 
+                                THEN (intensity + LEAD(intensity) OVER w) / 2.0 
+                                     * (LEAD(scan_time) OVER w - scan_time)
+                                ELSE 0
+                            END AS segment_area
+                     FROM filtered_range
+                     WINDOW w AS (PARTITION BY peak_label, ms_file_label ORDER BY scan_time)
+                 ),
 -- Group the filtered data into lists
                  aggregated AS (SELECT peak_label,
                                        ms_file_label,
                                        LIST(scan_time ORDER BY scan_time) AS scan_time,
                                        LIST(intensity ORDER BY scan_time) AS intensity,
-                                       ROUND(SUM(intensity), 0)           AS peak_area,
+                                       -- Trapezoid integration (more accurate than simple sum)
+                                       ROUND(SUM(segment_area), 0)        AS peak_area,
                                        ROUND(MAX(intensity), 0)           AS peak_max,
                                        ROUND(MIN(intensity), 0)           AS peak_min,
                                        ROUND(AVG(intensity), 0)           AS peak_mean,
                                        ROUND(MEDIAN(intensity), 0)        AS peak_median,
                                        COUNT(*)                           AS peak_n_datapoints
-                                FROM filtered_range
+                                FROM trapezoid_segments
                                 GROUP BY peak_label, ms_file_label),
 -- Compute peak_area_top3
                  top3_calc AS (

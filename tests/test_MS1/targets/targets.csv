@@ -1,0 +1,42 @@
+peak_label,peak_selection,bookmark,mz_mean,mz_width,mz,rt,rt_min,rt_max,rt_unit,intensity_threshold,polarity,filterLine,ms_type,category,score,notes,source
+Ornithine,True,False,131.0826,10,,141,513.824563981985,523.388777848366,s,0,Positive,,ms1,,,,targets.csv
+Adenine,True,False,134.0472,10,,88.8,282.08137127467,309.903890059074,s,0,Positive,,ms1,,,,targets.csv
+Histidine,True,False,154.0622,10,,140.4,507.871402933724,529.86723605572,s,0,Positive,,ms1,,,,targets.csv
+Tyrosine,True,False,180.0666,10,,117.6,442.878532226758,469.936610644928,s,0,Positive,,ms1,,,,targets.csv
+N-Acetylglycine,True,False,116.0353,10,,86.4,99.72144340366,129.910330834184,s,0,Positive,,ms1,,,,targets.csv
+Succinic acid,True,False,117.0193,10,,48.6,93.5890600622534,165.885784911484,s,0,Positive,,ms1,,,,targets.csv
+Methionine,True,False,148.0438,10,,114,421.117499651566,459.84388661759,s,0,Positive,,ms1,,,,targets.csv
+N-Acetylglutamine,True,False,187.0724,10,,110.4,230.705980644148,254.921798703841,s,0,Positive,,ms1,,,,targets.csv
+Leucine,True,False,130.0874,10,,111,404.098143406395,440.037098402366,s,0,Positive,,ms1,,,,targets.csv
+Lysine,True,False,145.0983,10,,142.2,516.473126540728,523.265228243402,s,0,Positive,,ms1,,,,targets.csv
+Pantothenic acid,True,False,218.1034,10,,54.6,172.275189992181,284.526147552776,s,0,Positive,,ms1,,,,targets.csv
+Thymine,True,False,125.0357,10,,40.8,45.4427130937658,69.6975484170872,s,0,Positive,,ms1,,,,targets.csv
+Asparagine,True,False,131.0462,10,,129,246.455465124859,269.384291151243,s,0,Positive,,ms1,,,,targets.csv
+Urocanic acid,True,False,137.0356,10,,84,259.956869592123,278.656346785728,s,0,Positive,,ms1,,,,targets.csv
+Uracil,True,False,111.02,10,,47.4,49.6165950130141,80.0165962964843,s,0,Positive,,ms1,,,,targets.csv
+Valine,True,False,116.0717,10,,118.8,226.876988400434,249.88628047718,s,0,Positive,,ms1,,,,targets.csv
+Threonine,True,False,118.051,10,,126,479.959933057976,500.155126870267,s,0,Positive,,ms1,,,,targets.csv
+Orotic acid,True,False,155.0098,10,,118.8,418.31649306949,430.660683602987,s,0,Positive,,ms1,,,,targets.csv
+N-Acetylmethionine,True,False,190.0543,10,,53.4,149.950380323203,190.143898487443,s,0,Positive,,ms1,,,,targets.csv
+Aspartic acid,True,False,132.0302,10,,138,509.133060141277,540.080636206281,s,0,Positive,,ms1,,,,targets.csv
+N-Acetylleucine,True,False,172.0979,10,,44.4,85.6875491032293,114.985006823513,s,0,Positive,,ms1,,,,targets.csv
+Arginine,True,False,173.1044,10,,141,513.917599854016,522.365742285794,s,0,Positive,,ms1,,,,targets.csv
+Xanthine,True,False,151.0262,10,,75,210.105881523513,256.244117455002,s,0,Positive,,ms1,,,,targets.csv
+N-Acetylglutamic acid,True,False,188.0564,10,,98.4,295.731357474669,314.984635784236,s,0,Positive,,ms1,,,,targets.csv
+N-Acetylthreonine,True,False,160.0615,10,,93,251.215699230369,299.901136490923,s,0,Positive,,ms1,,,,targets.csv
+Uric acid,True,False,167.0211,10,,102,333.647289278082,357.213752028404,s,0,Positive,,ms1,,,,targets.csv
+Tryptophan,True,False,203.0826,10,,112.2,420.971138748247,433.839808362091,s,0,Positive,,ms1,,,,targets.csv
+Serine,True,False,104.0353,10,,495,490.878995566363,499.981530095326,s,0,Positive,,ms1,,,,targets.csv
+Itaconic acid,True,False,129.0193,10,,52.2,279.15134481368,305.450072064732,s,0,Positive,,ms1,,,,targets.csv
+Phenylalanine,True,False,164.0717,10,,109.2,400.474523417791,420.110238080844,s,0,Positive,,ms1,,,,targets.csv
+N-Acetylphenylalanine,True,False,206.0823,10,,49.2,138.209665885737,169.97761805667,s,0,Positive,,ms1,,,,targets.csv
+Fumaric acid,True,False,115.0037,10,,96.6,239.413519558442,280.664224194805,s,0,Positive,,ms1,,,,targets.csv
+N-Acetylaspartic acid,True,False,174.0408,10,,105.6,334.754216206974,360.129765421141,s,0,Positive,,ms1,,,,targets.csv
+Glutamine,True,False,145.0619,10,,129.6,498.467977646675,505.20980462486,s,0,Positive,,ms1,,,,targets.csv
+Carnosine,True,False,225.0993,10,,142.2,515.89657444543,525.748996817268,s,0,Positive,,ms1,,,,targets.csv
+Nicotinic acid,True,False,122.0247,10,,61.8,49.5474067803016,60.9992983645231,s,0,Positive,,ms1,,,,targets.csv
+Glutamic acid,True,False,146.0459,10,,130.8,497.655100150276,510.010177151012,s,0,Positive,,ms1,,,,targets.csv
+Arabitol,True,False,151.0612,10,,102.6,252.53514105021,276.205531237039,s,0,Positive,,ms1,,,,targets.csv
+Citrulline,True,False,174.0884,10,,132.6,501.660384812694,510.021685315557,s,0,Positive,,ms1,,,,targets.csv
+Phosphoserine,True,False,184.0016,10,,155.4,497.631834995626,512.48424306331,s,0,Positive,,ms1,,,,targets.csv
+Phosphoserine1,True,False,184.0016,10,,155.4,497.631834995626,512.48424306331,s,0,Positive,,ms1,,,,targets.csv

@@ -344,7 +344,12 @@ def main():
                 elif sys.platform == "darwin":
                     subprocess.Popen(["open", url])
                 else:
-                    subprocess.Popen(["xdg-open", url])
+                    subprocess.Popen(
+                        ["xdg-open", url],
+                        start_new_session=True,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL
+                    )
             except Exception:
                 print(f"Please open your browser manually: {url}")
 

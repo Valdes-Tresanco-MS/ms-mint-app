@@ -29,11 +29,14 @@ from ..duckdb_manager import (
     build_order_by,
     build_where_and_params,
     calculate_optimal_batch_size,
+    calculate_optimal_params,
     compute_chromatograms_in_batches,
+    compute_fitted_results,
     compute_results_in_batches,
     create_pivot,
     duckdb_connection,
     duckdb_connection_mint,
+    get_physical_cores,
 )
 from ..plugin_interface import PluginInterface
 from .target_optimization import (
@@ -59,11 +62,6 @@ RESULTS_TABLE_COLUMNS = [
         'fixed': 'left'
     },
     {
-        'title': 'MS-Type',
-        'dataIndex': 'ms_type',
-        'width': '120px',
-    },
-    {
         'title': 'peak_area',
         'dataIndex': 'peak_area',
         'width': '120px',
@@ -72,6 +70,11 @@ RESULTS_TABLE_COLUMNS = [
         'title': 'peak_area_top3',
         'dataIndex': 'peak_area_top3',
         'width': '150px',
+    },    
+    {
+        'title': 'peak_max',
+        'dataIndex': 'peak_max',
+        'width': '120px',
     },
     {
         'title': 'peak_n_datapoints',
@@ -79,20 +82,11 @@ RESULTS_TABLE_COLUMNS = [
         'width': '170px',
     },
     {
-        'title': 'peak_max',
-        'dataIndex': 'peak_max',
-        'width': '120px',
-    },
-    {
-        'title': 'peak_max',
-        'dataIndex': 'peak_max',
-        'width': '120px',
-    },
-    {
         'title': 'peak_rt_of_max',
         'dataIndex': 'peak_rt_of_max',
         'width': '150px',
     },
+    # NOTE: EMG Peak Fitting columns are dynamically inserted here when fitting data exists
     # NOTE: SCALiR columns (Concentration, In Range, Unit) are dynamically inserted here
     # via the scalir_column_insert_index logic when concentrations.csv exists
     {
@@ -131,10 +125,14 @@ _layout = html.Div(
                         fac.AntdTitle(
                             'Processing', level=4, style={'margin': '0'}
                         ),
-                        fac.AntdIcon(
-                            id='processing-tour-icon',
-                            icon='pi-info',
-                            style={"cursor": "pointer", 'paddingLeft': '10px'},
+                        fac.AntdTooltip(
+                            fac.AntdIcon(
+                                id='processing-tour-icon',
+                                icon='pi-info',
+                                style={"cursor": "pointer", 'paddingLeft': '10px'},
+                                **{'aria-label': 'Show tutorial'},
+                            ),
+                            title='Show tutorial'
                         ),
                         fac.AntdSpace(
                             [
@@ -314,6 +312,18 @@ _layout = html.Div(
                                 'title': 'Intensity',
                                 'content': 'Mini-plot showing the chromatograms',
                             },
+                            'peak_area_fitted': {
+                                'title': 'peak_area_fitted',
+                                'content': 'Peak area from EMG curve fitting (more accurate for tailing peaks)',
+                            },
+                            'fit_r_squared': {
+                                'title': 'fit_r²',
+                                'content': 'Goodness of fit (R², 0-1). Higher values indicate better model agreement.',
+                            },
+                            'fit_success': {
+                                'title': 'fit_success',
+                                'content': 'Whether EMG fitting converged successfully (✓ = success, ✗ = failed).',
+                            },
                         },
                         filterOptions={
                             'peak_label': {'filterMode': 'keyword'},
@@ -408,19 +418,19 @@ _layout = html.Div(
                                 fac.AntdFormItem(
                                     fac.AntdInputNumber(
                                         id='processing-chromatogram-compute-cpu',
-                                        defaultValue=max(1, cpu_count() // 2),
+                                        defaultValue=calculate_optimal_params()[0],
                                         min=1,
                                         max=cpu_count(),
                                     ),
                                     label='CPU:',
                                     hasFeedback=True,
-                                    help=f"Selected {cpu_count() // 2} / {cpu_count()} cpus",
+                                    help=f"Selected {calculate_optimal_params()[0]} / {cpu_count()} cpus",
                                     id='processing-chromatogram-compute-cpu-item'
                                 ),
                                 fac.AntdFormItem(
                                     fac.AntdInputNumber(
                                         id='processing-chromatogram-compute-ram',
-                                        value=round(psutil.virtual_memory().available * 0.5 / (1024 ** 3), 1),
+                                        value=calculate_optimal_params()[1],
                                         min=1,
                                         precision=1,
                                         step=0.1,
@@ -429,27 +439,40 @@ _layout = html.Div(
                                     label='RAM:',
                                     hasFeedback=True,
                                     id='processing-chromatogram-compute-ram-item',
-                                    help=f"Selected "
-                                         f"{round(psutil.virtual_memory().available * 0.5 / (1024 ** 3), 1)}GB / "
-                                         f"{round(psutil.virtual_memory().available / (1024 ** 3), 1)}GB available RAM"
+                                    help=f"Recommended {calculate_optimal_params()[1]}GB / "
+                                         f"{round(psutil.virtual_memory().available / (1024 ** 3), 1)}GB available"
                                 ),
                                 fac.AntdFormItem(
                                     fac.AntdInputNumber(
                                         id='processing-chromatogram-compute-batch-size',
-                                        defaultValue=calculate_optimal_batch_size(
-                                            int(psutil.virtual_memory().available * 0.5 / (1024 ** 3)),
-                                            100000,  # Assume 100k pairs as default estimate
-                                            max(1, cpu_count() // 2)
-                                        ),
-                                        min=50,
-                                        step=50,
+                                        value=4000,  # Default; updated by callback based on CPU/RAM
+                                        min=500,
+                                        max=8000,
+                                        step=500,
                                     ),
                                     label='Batch Size:',
-                                    tooltip='Optimal pairs per batch based on RAM/CPU. '
-                                            'Higher values = faster but more memory.',
+                                    tooltip='Pairs per batch. Larger = faster (up to 8000). '
+                                            'Based on experimental benchmarks.',
                                 ),
                             ],
                             layout='inline'
+                        ),
+                        fac.AntdDivider('Peak Fitting'),
+                        fac.AntdSpace(
+                            [
+                                fac.AntdCheckbox(
+                                    id='processing-enable-fitting',
+                                    label='Enable EMG Peak Fitting',
+                                ),
+                                fac.AntdTooltip(
+                                    fac.AntdIcon(icon='antd-question-circle', style={'color': '#8c8c8c', 'cursor': 'help'}),
+                                    title='Fit Exponentially Modified Gaussian (EMG) to each peak for more accurate area quantification. '\
+                                          'Adds peak_area_fitted, fit_r², and fit_success columns. '\
+                                          'Best for peaks with tailing (asymmetric shape). '\
+                                          'Runs after standard processing using multiprocessing.',
+                                ),
+                            ],
+                            style={'marginBottom': '0.5rem'},
                         ),
                         fac.AntdDivider('Recompute'),
                         fac.AntdForm(
@@ -459,7 +482,7 @@ _layout = html.Div(
                                         id='processing-recompute',
                                         label='Recompute results'
                                     ),
-
+                                    style={'marginBottom': '0.5rem'},
                                 ),
                             ]
                         ),
@@ -468,7 +491,7 @@ _layout = html.Div(
                             type='warning',
                             showIcon=True,
                             id='processing-warning',
-                            style={'display': 'none'},
+                            style={'display': 'none', 'marginBottom': '2rem'},
                         )
                     ],
                     id='processing-options-container',
@@ -546,9 +569,11 @@ _layout = html.Div(
                                         fac.AntdFormItem(
                                             [
                                                 fac.AntdSelect(
-                                                    options=['peak_area', 'peak_area_top3', 'peak_mean',
+                                                    options=['peak_area', 'peak_area_fitted', 'peak_area_top3', 'peak_mean',
                                                              'peak_median', 'peak_n_datapoints', 'peak_min', 'peak_max',
-                                                             'peak_rt_of_max', 'total_intensity'],
+                                                             'peak_rt_of_max', 'peak_sigma', 'peak_tau', 'peak_asymmetry',
+                                                             'peak_rt_fitted', 'fit_r_squared', 'fit_success', 'total_intensity',
+                                                             'rt_aligned', 'rt_shift', 'peak_mz_of_max', 'scan_time', 'intensity'],
                                                     mode="multiple",
                                                     value=['peak_area', 'peak_area_top3', 'peak_mean',
                                                            'peak_median', 'peak_n_datapoints', 'peak_min', 'peak_max',
@@ -570,7 +595,9 @@ _layout = html.Div(
                                 fac.AntdButton(
                                     'Download',
                                     id='download-all-results-btn',
-                                    type='primary',
+                                    icon=fac.AntdIcon(icon='antd-download'),
+                                    autoSpin=True,
+                                    style={'minWidth': 110, 'textTransform': 'uppercase'},
                                 )
                             ],
                             justify='center',
@@ -618,9 +645,10 @@ _layout = html.Div(
                                         fac.AntdFormItem(
                                             [
                                                 fac.AntdSelect(
-                                                    options=['peak_area', 'peak_area_top3', 'peak_mean', 'peak_median',
+                                                    options=['peak_area', 'peak_area_fitted', 'peak_area_top3', 'peak_mean', 'peak_median',
                                                              'peak_n_datapoints', 'peak_min', 'peak_max',
-                                                             'peak_rt_of_max', 'total_intensity'],
+                                                             'peak_rt_of_max', 'peak_sigma', 'peak_tau', 'peak_asymmetry',
+                                                             'peak_rt_fitted', 'fit_r_squared', 'fit_success', 'total_intensity'],
                                                     value=['peak_area'],
                                                     style={"width": "100%"},
                                                     locale="en-us",
@@ -638,8 +666,10 @@ _layout = html.Div(
                                 ),
                                 fac.AntdButton(
                                     'Download',
-                                    type='primary',
                                     id='download-densematrix-results-btn',
+                                    icon=fac.AntdIcon(icon='antd-download'),
+                                    autoSpin=True,
+                                    style={'minWidth': 110, 'textTransform': 'uppercase'},
                                 )
                             ],
                             justify='center',
@@ -708,7 +738,7 @@ _layout = html.Div(
                         fac.AntdTooltip(
                             fac.AntdIcon(
                                 icon='antd-question-circle',
-                                style={'color': '#888', 'cursor': 'help'}
+                                style={'color': '#555', 'cursor': 'help'}
                             ),
                             title='Skipping plot generation speeds up the process significantly for large datasets.'
                         ),
@@ -825,7 +855,7 @@ _layout = html.Div(
                     align='flex-start',
                     style={'marginBottom': 12},
                 ),
-                fac.AntdText(id='scalir-plot-path', style={'fontSize': 12, 'color': '#666'}),
+                fac.AntdText(id='scalir-plot-path', style={'fontSize': 12, 'color': '#444'}),
                 dcc.Store(id='scalir-results-store'),
             ],
             id='scalir-modal',
@@ -1059,9 +1089,20 @@ def _download_all_results(wdir: str, ws_name: str, selected_columns: list) -> tu
         Tuple of (download_data, notification) where download_data is for dcc.Download
         and notification is AntdNotification or None
     """
+    # All columns that can be downloaded (matching the dropdown options in the modal)
     allowed_cols = {
+        # Core result columns
         'peak_area', 'peak_area_top3', 'peak_mean', 'peak_median',
         'peak_n_datapoints', 'peak_min', 'peak_max', 'peak_rt_of_max', 'total_intensity',
+        # EMG Peak Fitting columns
+        'peak_area_fitted', 'peak_sigma', 'peak_tau', 'peak_asymmetry',
+        'peak_rt_fitted', 'fit_r_squared', 'fit_success',
+        # Raw data arrays (optional - for advanced users)
+        'scan_time', 'intensity',
+        # RT alignment columns
+        'rt_aligned', 'rt_shift',
+        # m/z of max
+        'peak_mz_of_max',
     }
     
     if not selected_columns or not isinstance(selected_columns, list):
@@ -1096,11 +1137,111 @@ def _download_all_results(wdir: str, ws_name: str, selected_columns: list) -> tu
                 showProgress=True,
             )
         
-        cols = ', '.join(safe_cols)
-        filename = f"{T.today()}-MINT__{ws_name}-all_results.csv"
-        logger.info(f"Download request: {filename}")
+        # Check for existing backup file (generated when results table loads)
+        backup_path = Path(wdir) / "results" / "results_backup.csv"
         
-        # Use DuckDB COPY for faster export (2.87x speedup vs pandas)
+        filename = f"{T.today()}-MINT__{ws_name}-all_results.csv"
+        tmp_path = None
+        import os
+        
+        if backup_path.exists():
+            # 1. Use Polars to clean/filter the data first (respecting user column selection)
+            logger.info(f"Download request: {filename} (filtering columns with Polars)")
+            import polars as pl
+            import tempfile
+            
+            # Read schema to find available columns
+            lf = pl.scan_csv(backup_path, infer_schema_length=100)
+            available_cols = lf.collect_schema().names()
+            
+            # Filter to requested columns (always include keys)
+            cols_to_select = ['peak_label', 'ms_file_label'] + [
+                c for c in safe_cols 
+                if c in available_cols and c not in ('peak_label', 'ms_file_label')
+            ]
+            
+            # Write filtered data to temp file
+            with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.csv') as tmp:
+                tmp_path = tmp.name
+            
+            lf.select(cols_to_select).collect().write_csv(tmp_path)
+            
+        else:
+            # Fallback: generate from database if backup doesn't exist
+            logger.info(f"Backup missing for {filename}, generating from DB...")
+            tmp_path = _generate_csv_from_db(wdir, ws_name, safe_cols)
+            
+            if tmp_path is None:
+                return dash.no_update, fac.AntdNotification(
+                    message="Download Results",
+                    description="Database unavailable.",
+                    type="error",
+                    duration=4,
+                    placement="bottom",
+                    showProgress=True,
+                )
+        
+        # 2. Check size of the filtered file
+
+        file_size_mb = os.path.getsize(tmp_path) / (1024 * 1024)
+        
+        # 3. If file is large (>50MB), serve via Flask Direct Download + Modal
+        # This prevents browser freezing/crashing with base64 data
+        if file_size_mb > 50:
+            logger.info(f"File is large ({file_size_mb:.1f} MB). Using Direct Download via Modal.")
+            import base64
+            
+            # Encode path for Flask route
+            encoded_path = base64.urlsafe_b64encode(tmp_path.encode()).decode()
+            download_url = f"/download-results-direct/{encoded_path}?filename={filename}"
+            
+            return dash.no_update, fac.AntdModal(
+                title="Download Large Results File",
+                visible=True,
+                width=500,
+                children=[
+                    html.P(f"The filtered results file is large ({file_size_mb:.1f} MB)."),
+                    html.P("Click the button below to download it directly."),
+                    html.Div(
+                        fac.AntdButton(
+                            "DOWNLOAD RESULTS",
+                            href=download_url,
+                            target="_blank",
+                            icon=fac.AntdIcon(icon="antd-download"),
+                            style={
+                                "marginTop": "10px",
+                                "textTransform": "uppercase"
+                            }
+                        ),
+                        style={"textAlign": "center", "marginTop": "20px"}
+                    )
+                ],
+                okButtonProps={'style': {'display': 'none'}},
+                cancelButtonProps={'style': {'display': 'none'}}
+            )
+            
+        # 4. If file is small, standard dcc.Download is fine
+        return dcc.send_file(tmp_path, filename=filename), dash.no_update
+
+
+def _generate_csv_from_db(wdir: str, ws_name: str, safe_cols: list) -> str:
+    """Fallback: generate CSV from database when backup doesn't exist. Returns path to temp file."""
+    with duckdb_connection(wdir) as conn:
+        if conn is None:
+            return None
+        
+        # Build column list, converting arrays to comma-separated strings
+        col_list = []
+        for c in safe_cols:
+            if c in ('scan_time', 'intensity'):
+                col_list.append(f"array_to_string(r.{c}, ',') AS {c}")
+            elif c not in ('peak_label', 'ms_file_label', 'ms_type'): # Avoid dupes
+                col_list.append(f"r.{c}")
+        cols = ', '.join(col_list)
+        
+        filename = f"{T.today()}-MINT__{ws_name}-all_results.csv"
+        logger.info(f"Generating temporary CSV: {filename} (from database)")
+        
         import tempfile
         with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.csv') as tmp:
             tmp_path = tmp.name
@@ -1118,7 +1259,7 @@ def _download_all_results(wdir: str, ws_name: str, selected_columns: list) -> tu
             ) TO ? (HEADER, DELIMITER ',')
         """, (tmp_path,))
         
-    return dcc.send_file(tmp_path, filename=filename), dash.no_update
+    return tmp_path
 
 
 def _download_dense_matrix(wdir: str, ws_name: str, rows: list, cols: list, value: list) -> tuple:
@@ -1237,6 +1378,8 @@ def _delete_selected_results(wdir: str, selected_rows: list) -> tuple:
                     params
                 )
                 results_action_store = {'action': 'delete', 'status': 'success'}
+                # Invalidate backup file so it regenerates fresh on next download
+                (Path(wdir) / "results" / "results_backup.csv").unlink(missing_ok=True)
             else:
                 results_action_store = {'action': 'delete', 'status': 'failed'}
                 total_removed = [0, 0]
@@ -1290,6 +1433,8 @@ def _delete_all_results(wdir: str) -> tuple:
                 total_removed = list(total_removed_q)
                 conn.execute("DELETE FROM results")
                 results_action_store = {'action': 'delete', 'status': 'success'}
+                # Invalidate backup file so it regenerates fresh on next download
+                (Path(wdir) / "results" / "results_backup.csv").unlink(missing_ok=True)
                 logger.info(f"Deleted {total_removed[0]} targets and {total_removed[1]} samples from results.")
             
             conn.execute("COMMIT")
@@ -1313,6 +1458,31 @@ def _delete_all_results(wdir: str) -> tuple:
 
 
 def callbacks(app, fsc, cache):
+    # Flask route for direct file downloads (bypasses Dash's slow base64 encoding)
+    from flask import send_file as flask_send_file, request
+    
+    @app.server.route('/download-results-direct/<path:filepath>')
+    def download_results_direct(filepath):
+        """Serve large results files directly via Flask - much faster than dcc.send_file"""
+        # Decode the path (it's base64 encoded for safety)
+        import base64
+        try:
+            decoded_path = base64.urlsafe_b64decode(filepath.encode()).decode()
+            file_path = Path(decoded_path)
+            
+            # Get desired filename from query param, else use actual filename
+            download_name = request.args.get('filename', file_path.name)
+            
+            if file_path.exists() and file_path.suffix == '.csv':
+                return flask_send_file(
+                    str(file_path),
+                    as_attachment=True,
+                    download_name=download_name
+                )
+        except Exception as e:
+            logger.error(f"Direct download failed: {e}")
+        return "File not found", 404
+    
     # Clientside callback to toggle processing UI visibility based on workspace-status
     # This runs in the browser for instant UI updates without server roundtrips
     app.clientside_callback(
@@ -1402,55 +1572,15 @@ def callbacks(app, fsc, cache):
             logger.debug("results_table: PreventUpdate because wdir is not set")
             raise PreventUpdate
 
-        # Autosave results table on tab load/refresh for durability (throttled to limit I/O).
-        # Skip if processing just completed (already backed up there)
-        try:
-            # Check if processing just completed
-            skip_backup = False
-            if isinstance(results_actions, dict):
-                if results_actions.get('action') == 'processing' and results_actions.get('status') == 'completed':
-                    timestamp = results_actions.get('timestamp', 0)
-                    if time.time() - timestamp < 10:  # Within last 10 seconds
-                        skip_backup = True
-                        logger.debug("Skipping backup - processing just completed")
-            
-            if not skip_backup:
-                results_dir = Path(wdir) / "results"
-                results_dir.mkdir(parents=True, exist_ok=True)
-                backup_path = results_dir / "results_backup.csv"
-                should_write = True
-                if backup_path.exists():
-                    last_write = backup_path.stat().st_mtime
-                    should_write = (time.time() - last_write) > 30
-                if should_write:
-                    with duckdb_connection(wdir) as conn:
-                        if conn is None:
-                            logger.debug("results_table: PreventUpdate because database connection is None (backup)")
-                            raise PreventUpdate
-                        backup_sql = "SELECT * EXCLUDE (total_intensity) FROM results"
-                        scalir_path = Path(wdir) / "results" / "scalir" / "concentrations.csv"
-                        if scalir_path.exists():
-                            try:
-                                conn.execute(f"CREATE OR REPLACE TEMP VIEW backup_scalir AS SELECT * FROM read_csv_auto('{scalir_path}')")
-                                backup_sql = """
-                                    SELECT r.* EXCLUDE (total_intensity), s.pred_conc, s.in_range, s.unit 
-                                    FROM results r 
-                                    LEFT JOIN backup_scalir s 
-                                    ON r.ms_file_label = CAST(s.ms_file AS VARCHAR) 
-                                    AND r.peak_label = s.peak_label
-                                """
-                            except Exception as e:
-                                logger.warning(f"Failed to include SCALiR in backup: {e}")
+        # Connect to database using context manager
+        with duckdb_connection(wdir) as conn:
+            if conn is None:
+                logger.debug("results_table: PreventUpdate because database connection is None")
+                raise PreventUpdate
 
-                        conn.execute(
-                            f"COPY ({backup_sql}) TO ? (HEADER, DELIMITER ',')",
-                            (str(backup_path),),
-                        )
-                    logger.debug(f"Auto-backed up results to {backup_path}")
-        except PreventUpdate:
-            raise
-        except Exception:
-            pass
+            # Create alias for compatibility
+            conn.execute("PRAGMA enable_profiling='json'")
+            conn.execute("PRAGMA profile_output='duckdb_profile.json'")
 
         pagination = pagination or {
             'position': 'bottomCenter',
@@ -1498,7 +1628,7 @@ def callbacks(app, fsc, cache):
             column_types.update({row[0]: row[1] for row in samples_schema})
 
             where_sql, params = build_where_and_params(filter_, filterOptions)
-            where_sql = f"{where_sql} {'AND' if where_sql else 'WHERE'} r.peak_label IN ?"
+            where_sql = f"{where_sql} {'AND' if where_sql else 'WHERE'} r.peak_label IN ? AND s.use_for_processing = TRUE"
             params.append(selected_peaks)
 
             order_params: list = []
@@ -1508,21 +1638,61 @@ def callbacks(app, fsc, cache):
                 for idx, peak in enumerate(selected_peaks):
                     order_params.extend([idx, peak])
 
-            order_by_sql = (
-                "ORDER BY __peak_order__, ms_file_label"
-                if selected_peaks
-                else build_order_by(
-                    sorter,
-                    column_types,
-                    tie=('peak_label', 'ASC'),
-                    nocase_text=True
-                )
+            # Build sorter SQL (even when peaks selected, use as secondary sort)
+            sorter_sql = build_order_by(
+                sorter,
+                column_types,
+                tie=('peak_label', 'ASC') if not selected_peaks else None,
+                nocase_text=True
             )
+            
+            if selected_peaks:
+                # When peaks are selected, preserve selection order but allow column sorting as secondary
+                if sorter_sql:
+                    # Extract just the ORDER BY columns (without "ORDER BY" prefix)
+                    sorter_cols = sorter_sql.replace("ORDER BY ", "")
+                    order_by_sql = f"ORDER BY __peak_order__, {sorter_cols}"
+                else:
+                    order_by_sql = "ORDER BY __peak_order__, ms_file_label"
+            else:
+                order_by_sql = sorter_sql
 
             # Check for SCALiR concentrations and dynamically add columns
             scalir_join = ""
             scalir_select = ""
+            fitting_select = ""
             columns = RESULTS_TABLE_COLUMNS.copy()
+            
+            # Check if fitting data exists (any fit_success = TRUE)
+            has_fitting_data = False
+            try:
+                fitting_check = conn.execute(
+                    "SELECT EXISTS(SELECT 1 FROM results WHERE fit_success = TRUE LIMIT 1)"
+                ).fetchone()
+                has_fitting_data = fitting_check and fitting_check[0]
+            except Exception:
+                pass
+            
+            if has_fitting_data:
+                # Add fitting columns before Intensity (last column)
+                fitting_cols = [
+                    {'title': 'peak_area_fitted', 'dataIndex': 'peak_area_fitted', 'width': '175px', 'sorter': True},
+                    {'title': 'fit_r²', 'dataIndex': 'fit_r_squared', 'width': '100px', 'sorter': True},
+                    {
+                        'title': 'fit_success', 
+                        'dataIndex': 'fit_success', 
+                        'width': '110px',
+                        'filterOptions': [
+                            {'label': '✓ Success', 'value': '✓'},
+                            {'label': '✗ Failed', 'value': '✗'},
+                        ]
+                    },
+                ]
+                insert_idx = len(columns) - 1  # Before Intensity
+                for col in fitting_cols:
+                    columns.insert(insert_idx, col)
+                    insert_idx += 1
+                fitting_select = ", r.peak_area_fitted, r.fit_r_squared, r.fit_success"
             
             conc_file = Path(wdir) / "results" / "scalir" / "concentrations.csv"
             if conc_file.exists():
@@ -1578,12 +1748,26 @@ def callbacks(app, fsc, cache):
                 except Exception as e:
                     logger.warning(f"Failed to join SCALiR concentrations: {e}")
 
+            # Only fetch columns that are actually displayed in the table
+            # This avoids sending large unused arrays (scan_time, etc.) to the client
             filtered_sql = f"""
             WITH
             {f"target_order AS (SELECT * FROM (VALUES {order_values}) AS t(ord, target_peak_label))," if order_values else ""}
             filtered AS (
-              SELECT r.*, UPPER(s.ms_type) AS ms_type, s.sample_type
-              {scalir_select}
+              SELECT 
+                r.peak_label,
+                r.ms_file_label,
+                r.peak_area,
+                r.peak_area_top3,
+                r.peak_max,
+                r.peak_n_datapoints,
+                r.peak_rt_of_max
+                {fitting_select}
+                {scalir_select},
+                -- Convert intensity array to comma-separated string for lighter JSON payload
+                array_to_string(r.intensity, ',') AS intensity,
+                UPPER(s.ms_type) AS ms_type,
+                s.sample_type
               {", COALESCE(tord.ord, 1e9) AS __peak_order__" if order_values else ""}
               FROM results r
               LEFT JOIN samples s USING (ms_file_label)
@@ -1629,10 +1813,33 @@ def callbacks(app, fsc, cache):
                 params_paged = order_params + params + [effective_page_size, (current - 1) * effective_page_size]
                 df = conn.execute(sql, params_paged).df()
 
-        # Generate key column and round concentration if present
+        # Generate key column and round values for display
         df["key"] = df["peak_label"].astype(str) + "-" + df["ms_file_label"].astype(str)
         if 'scalir_conc' in df.columns:
             df['scalir_conc'] = df['scalir_conc'].round(4)
+        # Round fitting columns for cleaner display
+        if 'peak_area_fitted' in df.columns:
+            df['peak_area_fitted'] = df['peak_area_fitted'].round(0).astype('Int64')
+        if 'fit_r_squared' in df.columns:
+            df['fit_r_squared'] = df['fit_r_squared'].round(2)
+        # Convert fit_success boolean to display-friendly format
+        if 'fit_success' in df.columns:
+            df['fit_success'] = df['fit_success'].map({True: '✓', False: '✗', None: ''})
+        # Convert intensity string back to list for sparkline, downsampled to max 50 points
+        if 'intensity' in df.columns:
+            def parse_and_downsample(s, max_points=50):
+                if not s or pd.isna(s):
+                    return []
+                try:
+                    vals = [float(x) for x in str(s).split(',') if x.strip()]
+                    # Downsample if too many points
+                    if len(vals) > max_points:
+                        step = len(vals) / max_points
+                        vals = [vals[int(i * step)] for i in range(max_points)]
+                    return vals
+                except Exception:
+                    return []
+            df['intensity'] = df['intensity'].apply(parse_and_downsample)
         # Replace NaN with None for clean JSON serialization
         df = df.where(pd.notnull(df), None)
         data = df.to_dict('records')
@@ -1648,6 +1855,14 @@ def callbacks(app, fsc, cache):
             df["key"] = df["peak_label"].astype(str) + "-" + df["ms_file_label"].astype(str)
             if 'scalir_conc' in df.columns:
                 df['scalir_conc'] = df['scalir_conc'].round(4)
+            if 'peak_area_fitted' in df.columns:
+                df['peak_area_fitted'] = df['peak_area_fitted'].round(0).astype('Int64')
+            if 'fit_r_squared' in df.columns:
+                df['fit_r_squared'] = df['fit_r_squared'].round(2)
+            if 'fit_success' in df.columns:
+                df['fit_success'] = df['fit_success'].map({True: '✓', False: '✗', None: ''})
+            if 'intensity' in df.columns:
+                df['intensity'] = df['intensity'].apply(parse_and_downsample)
             df = df.where(pd.notnull(df), None)
             data = df.to_dict('records')
 
@@ -1836,6 +2051,8 @@ def callbacks(app, fsc, cache):
     @app.callback(
         Output("download-csv", "data"),
         Output("notifications-container", "children", allow_duplicate=True),
+        Output("download-all-results-btn", "loading"),
+        Output("download-densematrix-results-btn", "loading"),
 
         Input("download-all-results-btn", "nClicks"),
         Input("download-densematrix-results-btn", "nClicks"),
@@ -1868,7 +2085,7 @@ def callbacks(app, fsc, cache):
                 duration=4,
                 placement="bottom",
                 showProgress=True,
-            )
+            ), False, False
 
         ws_key = Path(wdir).stem
         with duckdb_connection_mint(Path(wdir).parent.parent) as mint_conn:
@@ -1881,11 +2098,13 @@ def callbacks(app, fsc, cache):
                 raise PreventUpdate
             ws_name = ws_row[0]
 
-        # Delegate to appropriate standalone function  
+        # Delegate to appropriate standalone function (returns tuple of download_data, notification)
         if prop_id == 'download-all-results-btn':
-            return _download_all_results(wdir, ws_name, d_options_value)
+            download_data, notification = _download_all_results(wdir, ws_name, d_options_value)
+            return download_data, notification, False, False
         else:
-            return _download_dense_matrix(wdir, ws_name, d_dm_rows, d_dm_cols, d_dm_value)
+            download_data, notification = _download_dense_matrix(wdir, ws_name, d_dm_rows, d_dm_cols, d_dm_value)
+            return download_data, notification, False, False
 
     @app.callback(
         Output('processing-tour-empty', 'current'),
@@ -2014,7 +2233,7 @@ def callbacks(app, fsc, cache):
             if results:
                 computed_results = results[0]
 
-        style = {'display': 'block'} if computed_results else {'display': 'none'}
+        style = {'display': 'block', 'marginBottom': '2rem'} if computed_results else {'display': 'none'}
 
         recompute = bool(computed_results)
 
@@ -2024,7 +2243,7 @@ def callbacks(app, fsc, cache):
         default_cpus = max(1, n_cpus_total // 2)
         
         available_ram_gb = psutil.virtual_memory().available / (1024 ** 3)
-        default_ram = min(float(default_cpus), available_ram_gb)
+        default_ram = round(min(float(default_cpus), available_ram_gb), 1)
         available_ram_gb_rounded = round(available_ram_gb, 1)
 
         help_cpu = f"Selected {default_cpus} / {n_cpus_total} cpus"
@@ -2051,6 +2270,7 @@ def callbacks(app, fsc, cache):
 
         Input('processing-modal', 'okCounts'),
         State('processing-recompute', 'checked'),
+        State('processing-enable-fitting', 'checked'),
         State("processing-chromatogram-compute-cpu", "value"),
         State("processing-chromatogram-compute-ram", "value"),
         State('processing-chromatogram-compute-batch-size', "value"),
@@ -2085,7 +2305,7 @@ def callbacks(app, fsc, cache):
         ],
         prevent_initial_call=True
     )
-    def compute_results(set_progress, okCounts, recompute, n_cpus, ram, batch_size, bookmarked, wdir):
+    def compute_results(set_progress, okCounts, recompute, enable_fitting, n_cpus, ram, batch_size, bookmarked, wdir):
 
         if not okCounts:
             logger.debug("compute_results: PreventUpdate because okCounts is None")
@@ -2117,9 +2337,23 @@ def callbacks(app, fsc, cache):
                                n_cpus=n_cpus,
                                ram=ram)
 
+            # Run peak fitting if enabled
+            if enable_fitting:
+                logger.info('Computing peak fitting (EMG)...')
+                progress_adapter(0, "Peak Fitting", "Starting EMG fitting...")
+                fit_stats = compute_fitted_results(
+                    wdir=wdir,
+                    use_bookmarked=bookmarked,
+                    recompute=recompute,
+                    n_workers=n_cpus or 8,
+                    set_progress=progress_adapter,
+                    n_cpus=n_cpus,
+                    ram=ram
+                )
+                logger.info(f"Peak fitting complete: {fit_stats}")
 
             # Persist the results table to a workspace folder for resilience
-            progress_adapter(100, "Results", "Backing up results...")
+            progress_adapter(100, "Finalizing", "Backing up results...")
             try:
                 results_dir = Path(wdir) / "results"
                 results_dir.mkdir(parents=True, exist_ok=True)
@@ -2226,7 +2460,7 @@ def callbacks(app, fsc, cache):
         help_ram = _get_ram_help_text(ram)
         # Auto-calculate optimal batch size based on current CPU and RAM
         optimal_batch = calculate_optimal_batch_size(
-            int(ram) if ram else 8,
+            round(ram) if ram else 8,
             100000,  # Estimate for total pairs
             int(cpu) if cpu else max(1, cpu_count() // 2)
         )
@@ -2247,7 +2481,7 @@ def callbacks(app, fsc, cache):
     )
 
     # Open SCALiR modal and load existing results if available
-    @app.callback(
+    app.callback(
         Output('scalir-modal', 'visible'),
         Output('scalir-status-text', 'children'),
         Output('scalir-conc-path', 'children'),
@@ -2259,97 +2493,17 @@ def callbacks(app, fsc, cache):
         Input('scalir-modal-btn', 'nClicks'),
         State('wdir', 'data'),
         prevent_initial_call=True,
-    )
-    def open_scalir_modal(n_clicks, wdir):
-        if not n_clicks:
-            raise PreventUpdate
-        
-        # Default empty return (modal visible, everything else empty)
-        empty_ret = (
-            True, "", "", [], None, [], 
-            {'display': 'none', 'flexGrow': 1, 'minWidth': '350px'}, 
-            None
-        )
-
-        if not wdir:
-            return empty_ret
-
-        output_dir = Path(wdir) / "results" / "scalir"
-        train_frame_path = output_dir / "train_frame.csv"
-        params_path = output_dir / "standard_curve_parameters.csv"
-        
-        # If results don't exist, just open empty modal
-        if not train_frame_path.exists() or not params_path.exists():
-            return empty_ret
-
-        try:
-            train_frame = pd.read_csv(train_frame_path)
-            params = pd.read_csv(params_path)
-            
-            units_path = output_dir / "units.csv"
-            units_filtered = pd.read_csv(units_path) if units_path.exists() else None
-            concentrations_path = output_dir / "concentrations.csv"
-            
-            common = sorted(train_frame['peak_label'].unique())
-            metabolite_options = [{'label': label, 'value': label} for label in common]
-            first_label = common[0] if common else None
-
-            PLOTLY_HIGH_RES_CONFIG = {
-                'displayModeBar': False,
-                'displaylogo': False,
-            }
-
-            # Generate initial plot
-            plots = []
-            if first_label and not train_frame.empty:
-                fig = _plot_curve_fig(train_frame, first_label, units_filtered, params)
-                plots.append(
-                    dcc.Graph(
-                        figure=fig,
-                        style={'width': '100%', 'height': '450px'},
-                        config=PLOTLY_HIGH_RES_CONFIG,
-                    )
-                )
-            
-            plot_style = {
-                'display': 'block', 
-                'flexGrow': 1, 
-                'minWidth': '350px', 
-                'maxHeight': '400px', 
-                'overflowY': 'auto'
-            } if plots else {'display': 'none'}
-
-            store_data = {
-                "train_frame": train_frame.to_json(orient="split"),
-                "units": units_filtered.to_json(orient="split") if units_filtered is not None else None,
-                "params": params.to_json(orient="split"),
-                "plot_dir": str(output_dir / "plots"),
-                "common": common,
-                "generated_all_plots": True
-            }
-            
-            status_text = f"Loaded results for {len(common)} metabolites."
-            conc_text = f"Concentrations: {concentrations_path}" if concentrations_path.exists() else ""
-            
-            return (True, status_text, conc_text, metabolite_options, first_label, plots, plot_style, store_data)
-
-        except Exception as e:
-            logger.error(f"SCALiR: Failed to load existing results: {e}", exc_info=True)
-            return empty_ret
+    )(open_scalir_modal)
 
     # Show standards filename
-    @app.callback(
+    app.callback(
         Output('scalir-standards-note', 'children'),
         Input('scalir-standards-upload', 'filename'),
         prevent_initial_call=True,
-    )
-    def show_standards_filename(filename):
-        if filename:
-            return filename
-        return "No standards file selected."
+    )(show_standards_filename)
 
     # Run SCALiR
-    @app.callback(
+    app.callback(
         Output('scalir-status-text', 'children', allow_duplicate=True),
         Output('scalir-conc-path', 'children', allow_duplicate=True),
         Output('scalir-metabolite-select', 'options', allow_duplicate=True),
@@ -2369,184 +2523,10 @@ def callbacks(app, fsc, cache):
         State('wdir', 'data'),
         State('section-context', 'data'),
         prevent_initial_call=True,
-    )
-    def run_scalir(n_clicks, standards_contents, standards_filename, intensity, slope_mode,
-                   slope_low, slope_high, generate_plots, wdir, section_context):
-        if not n_clicks:
-            raise PreventUpdate
-        if not section_context or section_context.get('page') != 'Processing':
-            raise PreventUpdate
-
-        import plotly.graph_objects as go
-        PLOTLY_HIGH_RES_CONFIG = {
-            'toImageButtonOptions': {
-                'format': 'png',
-                'scale': 4,
-                'height': None,
-                'width': None,
-            },
-            'displayModeBar': True,
-            'displaylogo': False,
-        }
-
-        hidden_style = {
-            'display': 'none',
-            'flexWrap': 'wrap',
-            'gap': '16px',
-            'paddingTop': '8px',
-            'justifyContent': 'flex-start',
-        }
-        if not wdir:
-            return ("No active workspace.", "", [], None, [], hidden_style, None, False)
-        try:
-            logger.info(f"SCALiR: Parsing standards file {standards_filename}...")
-            standards_df = _parse_uploaded_standards(standards_contents, standards_filename)
-        except Exception as exc:
-            logger.error(f"SCALiR: Failed to parse standards file: {exc}")
-            return (f"Upload a standards table (CSV). Error: {exc}", "", [], None, [], hidden_style, None, False)
-
-        with duckdb_connection(wdir) as conn:
-            if conn is None:
-                logger.error("SCALiR: Failed to connect to database.")
-                return ("Database connection failed.", "", [], None, [], hidden_style, None, False)
-            if intensity not in SCALIR_ALLOWED_METRICS:
-                intensity = 'peak_area'
-            try:
-                mint_df = conn.execute(f"""
-                    SELECT ms_file_label AS ms_file, peak_label, {intensity}
-                    FROM results
-                    WHERE {intensity} IS NOT NULL
-                """).df()
-            except Exception as exc:
-                logger.error(f"SCALiR: Could not load results from database: {exc}")
-                return (f"Could not load results: {exc}", "", [], None, [], hidden_style, None, False)
-
-        if mint_df.empty:
-            return ("No results found for calibration.", "", [], None, [], hidden_style, None, False)
-
-        units_df = None
-        if "unit" in standards_df.columns:
-            units_df = standards_df[["peak_label", "unit"]].copy()
-            standards_df = standards_df.drop(columns=["unit"])
-
-        try:
-            mint_filtered, standards_filtered, units_filtered, common = intersect_peaks(
-                mint_df, standards_df, units_df
-            )
-        except Exception as exc:
-            logger.error(f"SCALiR: Alignment failed: {exc}", exc_info=True)
-            return (f"Could not align standards with results: {exc}", "", [], None, [], hidden_style, None, False)
-
-        if not common:
-            return ("No overlapping peak_label values between results and standards.", "", [], None, [], hidden_style, None, False)
-
-        low = slope_low or 0.85
-        high = slope_high or 1.15
-        slope_interval = (min(low, high), max(low, high))
-
-        try:
-            logger.info(f"SCALiR: Before fit - mint_filtered: {len(mint_filtered)} rows, cols: {list(mint_filtered.columns)}")
-            logger.info(f"SCALiR: Before fit - standards_filtered: {len(standards_filtered)} rows, cols: {list(standards_filtered.columns)}")
-            estimator, std_results, x_train, y_train, params = fit_estimator(
-                mint_filtered, standards_filtered, intensity, slope_mode or "fixed", slope_interval
-            )
-            logger.info(f"SCALiR: After fit - std_results: {len(std_results)} rows, x_train: {len(x_train)} rows")
-            logger.info(f"SCALiR: Fitting completed. Metabolites: {len(common)}")
-            concentrations = build_concentration_table(
-                estimator, mint_filtered, intensity, units_filtered
-            )
-        except Exception as exc:
-            logger.error(f"SCALiR: Fitting failed: {exc}", exc_info=True)
-            return (f"Error fitting calibration: {exc}", "", [], None, [], hidden_style, None, False)
-
-        output_dir = Path(wdir) / "results" / "scalir"
-        plots_dir = output_dir / "plots"
-        output_dir.mkdir(parents=True, exist_ok=True)
-        if generate_plots:
-            plots_dir.mkdir(parents=True, exist_ok=True)
-
-        concentrations_path = output_dir / "concentrations.csv"
-        params_path = output_dir / "standard_curve_parameters.csv"
-        concentrations.to_csv(concentrations_path, index=False)
-        params.to_csv(params_path, index=False)
-
-        # Save train_frame and units for persistence
-        try:
-            logger.info(f"SCALiR: x_train has {len(x_train)} rows, columns: {list(x_train.columns)}")
-            if 'value' in x_train.columns:
-                logger.info(f"SCALiR: x_train.value stats - min: {x_train['value'].min()}, max: {x_train['value'].max()}, values > 0: {(x_train['value'] > 0).sum()}")
-            train_frame = training_plot_frame(estimator, x_train, y_train, params)
-            train_frame_path = output_dir / "train_frame.csv"
-            train_frame.to_csv(train_frame_path, index=False)
-            logger.info(f"SCALiR: train_frame has {len(train_frame)} rows, columns: {list(train_frame.columns)}")
-        except Exception as exc:
-            logger.error(f"SCALiR: Failed to build train_frame: {exc}", exc_info=True)
-            train_frame = pd.DataFrame()
-
-        if units_filtered is not None:
-            units_path = output_dir / "units.csv"
-            units_filtered.to_csv(units_path, index=False)
-
-        if generate_plots and not train_frame.empty:
-            for label in common:
-                plot_standard_curve(train_frame, label, units_filtered, plots_dir)
-
-        sorted_common = sorted(common)
-        metabolite_options = [{'label': label, 'value': label} for label in sorted_common]
-        first_label = sorted_common[0] if sorted_common else None
-        initial_selection = first_label  # Single value for single-select mode
-
-        PLOTLY_HIGH_RES_CONFIG = {
-            'displayModeBar': False,
-            'displaylogo': False,
-        }
-
-        # Generate initial plot for the first selected metabolite
-        plots = []
-        if first_label and not train_frame.empty:
-            fig = _plot_curve_fig(train_frame, first_label, units_filtered, params)
-            plots.append(
-                dcc.Graph(
-                    figure=fig,
-                    style={
-                        'width': '100%',
-                        'height': '450px',
-                    },
-                    config=PLOTLY_HIGH_RES_CONFIG,
-                )
-            )
-
-        plot_style = {
-            'display': 'block' if plots else 'none',
-            'flexGrow': 1,
-            'minWidth': '350px',
-            'maxHeight': '400px',
-            'overflowY': 'auto',
-        }
-
-        store_data = {
-            "train_frame": train_frame.to_json(orient="split") if not train_frame.empty else None,
-            "units": units_filtered.to_json(orient="split") if units_filtered is not None else None,
-            "params": params.to_json(orient="split") if not params.empty else None,
-            "plot_dir": str(plots_dir),
-            "common": common,
-            "generated_all_plots": bool(generate_plots),
-        }
-
-        status_text = f"Fitted {len(common)} metabolites with intensity '{intensity}'."
-        return (
-            status_text,
-            f"Concentrations: {concentrations_path}",
-            metabolite_options,
-            initial_selection,
-            plots,
-            plot_style,
-            store_data,
-            False,
-        )
+    )(run_scalir)
 
     # Reset SCALiR modal
-    @app.callback(
+    app.callback(
         Output('scalir-status-text', 'children', allow_duplicate=True),
         Output('scalir-conc-path', 'children', allow_duplicate=True),
         Output('scalir-metabolite-select', 'options', allow_duplicate=True),
@@ -2559,86 +2539,351 @@ def callbacks(app, fsc, cache):
         Output('scalir-standards-note', 'children', allow_duplicate=True),
         Input('scalir-reset-btn', 'nClicks'),
         prevent_initial_call=True,
-    )
-    def reset_scalir(n_clicks):
-        if not n_clicks:
-            raise PreventUpdate
-        return (
-            "",
-            "",
-            [],
-            None,  # Single value for single-select
-            [],
-            {
-                'display': 'none',
-                'flexGrow': 1,
-                'minWidth': '350px',
-            },
-            None,
-            None,
-            None,
-            "No standards file selected.",
-        )
+    )(reset_scalir)
 
     # Update SCALiR plots based on metabolite selection
-    @app.callback(
+    app.callback(
         Output('scalir-plot-graphs', 'children', allow_duplicate=True),
         Output('scalir-plot-graphs', 'style', allow_duplicate=True),
         Output('scalir-plot-path', 'children'),
         Input('scalir-metabolite-select', 'value'),
         State('scalir-results-store', 'data'),
         prevent_initial_call=True,
+    )(update_scalir_plot)
+
+
+
+def open_scalir_modal(n_clicks, wdir):
+    if not n_clicks:
+        raise PreventUpdate
+    
+    # Default empty return (modal visible, everything else empty)
+    empty_ret = (
+        True, "", "", [], None, [], 
+        {'display': 'none', 'flexGrow': 1, 'minWidth': '350px'}, 
+        None
     )
-    def update_scalir_plot(selected_label, store_data):
-        import plotly.graph_objects as go
+
+    if not wdir:
+        return empty_ret
+
+    output_dir = Path(wdir) / "results" / "scalir"
+    train_frame_path = output_dir / "train_frame.csv"
+    params_path = output_dir / "standard_curve_parameters.csv"
+    
+    # If results don't exist, just open empty modal
+    if not train_frame_path.exists() or not params_path.exists():
+        return empty_ret
+
+    try:
+        train_frame = pd.read_csv(train_frame_path)
+        params = pd.read_csv(params_path)
+        
+        units_path = output_dir / "units.csv"
+        units_filtered = pd.read_csv(units_path) if units_path.exists() else None
+        concentrations_path = output_dir / "concentrations.csv"
+        
+        common = sorted(train_frame['peak_label'].unique())
+        metabolite_options = [{'label': label, 'value': label} for label in common]
+        first_label = common[0] if common else None
+
         PLOTLY_HIGH_RES_CONFIG = {
             'displayModeBar': False,
             'displaylogo': False,
         }
 
-        # If no selection, hide plots
-        if not selected_label:
-            return [], {'display': 'none'}, ""
+        # Generate initial plot
+        plots = []
+        if first_label and not train_frame.empty:
+            fig = _plot_curve_fig(train_frame, first_label, units_filtered, params)
+            plots.append(
+                dcc.Graph(
+                    figure=fig,
+                    style={'width': '100%', 'height': '450px'},
+                    config=PLOTLY_HIGH_RES_CONFIG,
+                )
+            )
+        
+        plot_style = {
+            'display': 'block', 
+            'flexGrow': 1, 
+            'minWidth': '350px', 
+            'maxHeight': '400px', 
+            'overflowY': 'auto'
+        } if plots else {'display': 'none'}
 
-        if not store_data:
-            raise PreventUpdate
+        store_data = {
+            "train_frame": train_frame.to_json(orient="split"),
+            "units": units_filtered.to_json(orient="split") if units_filtered is not None else None,
+            "params": params.to_json(orient="split"),
+            "plot_dir": str(output_dir / "plots"),
+            "common": common,
+            "generated_all_plots": True
+        }
+        
+        status_text = f"Loaded results for {len(common)} metabolites."
+        conc_text = f"Concentrations: {concentrations_path}" if concentrations_path.exists() else ""
+        
+        return (True, status_text, conc_text, metabolite_options, first_label, plots, plot_style, store_data)
 
-        train_frame_json = store_data.get("train_frame")
-        if not train_frame_json:
-            raise PreventUpdate
+    except Exception as e:
+        logger.error(f"SCALiR: Failed to load existing results: {e}", exc_info=True)
+        return empty_ret
 
-        train_frame = pd.read_json(StringIO(train_frame_json), orient="split")
-        units_json = store_data.get("units")
-        units_df = pd.read_json(StringIO(units_json), orient="split") if units_json else None
-        params_json = store_data.get("params")
-        params_df = pd.read_json(StringIO(params_json), orient="split") if params_json else None
 
-        # Single metabolite plot
-        fig = _plot_curve_fig(train_frame, selected_label, units_df, params_df)
-        plots = [
+def show_standards_filename(filename):
+    if filename:
+        return filename
+    return "No standards file selected."
+
+
+def run_scalir(n_clicks, standards_contents, standards_filename, intensity, slope_mode,
+               slope_low, slope_high, generate_plots, wdir, section_context):
+    if not n_clicks:
+        raise PreventUpdate
+    if not section_context or section_context.get('page') != 'Processing':
+        raise PreventUpdate
+
+    import plotly.graph_objects as go
+    PLOTLY_HIGH_RES_CONFIG = {
+        'toImageButtonOptions': {
+            'format': 'png',
+            'scale': 4,
+            'height': None,
+            'width': None,
+        },
+        'displayModeBar': True,
+        'displaylogo': False,
+    }
+
+    hidden_style = {
+        'display': 'none',
+        'flexWrap': 'wrap',
+        'gap': '16px',
+        'paddingTop': '8px',
+        'justifyContent': 'flex-start',
+    }
+    if not wdir:
+        return ("No active workspace.", "", [], None, [], hidden_style, None, False)
+    try:
+        logger.info(f"SCALiR: Parsing standards file {standards_filename}...")
+        standards_df = _parse_uploaded_standards(standards_contents, standards_filename)
+    except Exception as exc:
+        logger.error(f"SCALiR: Failed to parse standards file: {exc}")
+        return (f"Upload a standards table (CSV). Error: {exc}", "", [], None, [], hidden_style, None, False)
+
+    with duckdb_connection(wdir) as conn:
+        if conn is None:
+            logger.error("SCALiR: Failed to connect to database.")
+            return ("Database connection failed.", "", [], None, [], hidden_style, None, False)
+        if intensity not in SCALIR_ALLOWED_METRICS:
+            intensity = 'peak_area'
+        try:
+            mint_df = conn.execute(f"""
+                SELECT ms_file_label AS ms_file, peak_label, {intensity}
+                FROM results
+                WHERE {intensity} IS NOT NULL
+            """).df()
+        except Exception as exc:
+            logger.error(f"SCALiR: Could not load results from database: {exc}")
+            return (f"Could not load results: {exc}", "", [], None, [], hidden_style, None, False)
+
+    if mint_df.empty:
+        return ("No results found for calibration.", "", [], None, [], hidden_style, None, False)
+
+    units_df = None
+    if "unit" in standards_df.columns:
+        units_df = standards_df[["peak_label", "unit"]].copy()
+        standards_df = standards_df.drop(columns=["unit"])
+
+    try:
+        mint_filtered, standards_filtered, units_filtered, common = intersect_peaks(
+            mint_df, standards_df, units_df
+        )
+    except Exception as exc:
+        logger.error(f"SCALiR: Alignment failed: {exc}", exc_info=True)
+        return (f"Could not align standards with results: {exc}", "", [], None, [], hidden_style, None, False)
+
+    if not common:
+        return ("No overlapping peak_label values between results and standards.", "", [], None, [], hidden_style, None, False)
+
+    low = slope_low or 0.85
+    high = slope_high or 1.15
+    slope_interval = (min(low, high), max(low, high))
+
+    try:
+        logger.info(f"SCALiR: Before fit - mint_filtered: {len(mint_filtered)} rows, cols: {list(mint_filtered.columns)}")
+        logger.info(f"SCALiR: Before fit - standards_filtered: {len(standards_filtered)} rows, cols: {list(standards_filtered.columns)}")
+        estimator, std_results, x_train, y_train, params = fit_estimator(
+            mint_filtered, standards_filtered, intensity, slope_mode or "fixed", slope_interval
+        )
+        logger.info(f"SCALiR: After fit - std_results: {len(std_results)} rows, x_train: {len(x_train)} rows")
+        logger.info(f"SCALiR: Fitting completed. Metabolites: {len(common)}")
+        concentrations = build_concentration_table(
+            estimator, mint_filtered, intensity, units_filtered
+        )
+    except Exception as exc:
+        logger.error(f"SCALiR: Fitting failed: {exc}", exc_info=True)
+        return (f"Error fitting calibration: {exc}", "", [], None, [], hidden_style, None, False)
+
+    output_dir = Path(wdir) / "results" / "scalir"
+    plots_dir = output_dir / "plots"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    if generate_plots:
+        plots_dir.mkdir(parents=True, exist_ok=True)
+
+    concentrations_path = output_dir / "concentrations.csv"
+    params_path = output_dir / "standard_curve_parameters.csv"
+    concentrations.to_csv(concentrations_path, index=False)
+    params.to_csv(params_path, index=False)
+
+    # Save train_frame and units for persistence
+    try:
+        logger.info(f"SCALiR: x_train has {len(x_train)} rows, columns: {list(x_train.columns)}")
+        if 'value' in x_train.columns:
+            logger.info(f"SCALiR: x_train.value stats - min: {x_train['value'].min()}, max: {x_train['value'].max()}, values > 0: {(x_train['value'] > 0).sum()}")
+        train_frame = training_plot_frame(estimator, x_train, y_train, params)
+        train_frame_path = output_dir / "train_frame.csv"
+        train_frame.to_csv(train_frame_path, index=False)
+        logger.info(f"SCALiR: train_frame has {len(train_frame)} rows, columns: {list(train_frame.columns)}")
+    except Exception as exc:
+        logger.error(f"SCALiR: Failed to build train_frame: {exc}", exc_info=True)
+        train_frame = pd.DataFrame()
+
+    if units_filtered is not None:
+        units_path = output_dir / "units.csv"
+        units_filtered.to_csv(units_path, index=False)
+
+    if generate_plots and not train_frame.empty:
+        for label in common:
+            plot_standard_curve(train_frame, label, units_filtered, plots_dir)
+
+    sorted_common = sorted(common)
+    metabolite_options = [{'label': label, 'value': label} for label in sorted_common]
+    first_label = sorted_common[0] if sorted_common else None
+    initial_selection = first_label  # Single value for single-select mode
+
+    PLOTLY_HIGH_RES_CONFIG = {
+        'displayModeBar': False,
+        'displaylogo': False,
+    }
+
+    # Generate initial plot for the first selected metabolite
+    plots = []
+    if first_label and not train_frame.empty:
+        fig = _plot_curve_fig(train_frame, first_label, units_filtered, params)
+        plots.append(
             dcc.Graph(
                 figure=fig,
                 style={
                     'width': '100%',
-                    'maxWidth': '500px',
-                    'height': '400px',
+                    'height': '450px',
                 },
                 config=PLOTLY_HIGH_RES_CONFIG,
             )
-        ]
+        )
 
-        plot_dir = Path(store_data.get("plot_dir", ""))
-        plot_path = ""
-        if selected_label and store_data.get("generated_all_plots") and plot_dir:
-            candidate = plot_dir / f"{slugify_label(selected_label)}_curve.png"
-            if candidate.exists():
-                plot_path = f"Plot saved at: {candidate}"
+    plot_style = {
+        'display': 'block' if plots else 'none',
+        'flexGrow': 1,
+        'minWidth': '350px',
+        'maxHeight': '400px',
+        'overflowY': 'auto',
+    }
 
-        return plots, {
-            'display': 'block',
+    store_data = {
+        "train_frame": train_frame.to_json(orient="split") if not train_frame.empty else None,
+        "units": units_filtered.to_json(orient="split") if units_filtered is not None else None,
+        "params": params.to_json(orient="split") if not params.empty else None,
+        "plot_dir": str(plots_dir),
+        "common": common,
+        "generated_all_plots": bool(generate_plots),
+    }
+
+    status_text = f"Fitted {len(common)} metabolites with intensity '{intensity}'."
+    return (
+        status_text,
+        f"Concentrations: {concentrations_path}",
+        metabolite_options,
+        initial_selection,
+        plots,
+        plot_style,
+        store_data,
+        False,
+    )
+
+
+def reset_scalir(n_clicks):
+    if not n_clicks:
+        raise PreventUpdate
+    return (
+        "",
+        "",
+        [],
+        None,  # Single value for single-select
+        [],
+        {
+            'display': 'none',
             'flexGrow': 1,
             'minWidth': '350px',
-        }, plot_path
+        },
+        None,
+        None,
+        None,
+        "No standards file selected.",
+    )
+
+
+def update_scalir_plot(selected_label, store_data):
+    import plotly.graph_objects as go
+    PLOTLY_HIGH_RES_CONFIG = {
+        'displayModeBar': False,
+        'displaylogo': False,
+    }
+
+    # If no selection, hide plots
+    if not selected_label:
+        return [], {'display': 'none'}, ""
+
+    if not store_data:
+        raise PreventUpdate
+
+    train_frame_json = store_data.get("train_frame")
+    if not train_frame_json:
+        raise PreventUpdate
+
+    train_frame = pd.read_json(StringIO(train_frame_json), orient="split")
+    units_json = store_data.get("units")
+    units_df = pd.read_json(StringIO(units_json), orient="split") if units_json else None
+    params_json = store_data.get("params")
+    params_df = pd.read_json(StringIO(params_json), orient="split") if params_json else None
+
+    # Single metabolite plot
+    fig = _plot_curve_fig(train_frame, selected_label, units_df, params_df)
+    plots = [
+        dcc.Graph(
+            figure=fig,
+            style={
+                'width': '100%',
+                'maxWidth': '500px',
+                'height': '400px',
+            },
+            config=PLOTLY_HIGH_RES_CONFIG,
+        )
+    ]
+
+    plot_dir = Path(store_data.get("plot_dir", ""))
+    plot_path = ""
+    if selected_label and store_data.get("generated_all_plots") and plot_dir:
+        candidate = plot_dir / f"{slugify_label(selected_label)}_curve.png"
+        if candidate.exists():
+            plot_path = f"Plot saved at: {candidate}"
+
+    return plots, {
+        'display': 'block',
+        'flexGrow': 1,
+        'minWidth': '350px',
+    }, plot_path
 
 
 def _plot_curve_fig(frame: pd.DataFrame, peak_label: str, units: pd.DataFrame = None, params_df: pd.DataFrame = None):

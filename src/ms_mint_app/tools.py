@@ -16,7 +16,7 @@ import pandas as pd
 import pyarrow as pa
 from pyarrow import parquet as pq
 from dash.exceptions import PreventUpdate
-from lxml.etree import XMLSyntaxError
+import pygixml
 from scipy.ndimage import binary_opening
 
 from .duckdb_manager import duckdb_connection
@@ -239,6 +239,66 @@ def rt_to_seconds(val) -> float:
     return h * 3600.0 + mi * 60.0 + se
 
 
+def get_acquisition_datetime(file_path: str | Path) -> Optional[str]:
+    """
+    Extract acquisition datetime from mzML/mzXML file header.
+    
+    For mzML: reads startTimeStamp from <run> element
+    For mzXML: reads startTime from <msRun> element or falls back to file mtime
+    
+    Returns ISO format datetime string or None if not found.
+    """
+    from datetime import datetime
+    import pygixml
+    
+    file_path = Path(file_path)
+    suffix = file_path.suffix.lower()
+    
+    try:
+        doc = pygixml.parse_file(str(file_path))
+        root = doc.first_child()
+        
+        if suffix == ".mzml":
+            # Look for <run startTimeStamp="...">
+            runs = root.select_nodes("//*[local-name()='run']")
+            for run_node in runs:
+                run = run_node.node
+                timestamp = run.attribute("startTimeStamp").value
+                if timestamp:
+                    # ISO 8601 format: 2024-01-15T10:30:00Z
+                    return timestamp
+        
+        elif suffix == ".mzxml":
+            # Look for <msRun startTime="..." or <msRun>...<startTime>
+            ms_runs = root.select_nodes("//*[local-name()='msRun']")
+            for run_node in ms_runs:
+                run = run_node.node
+                # Check attribute first
+                start_time = run.attribute("startTime").value
+                if start_time and not start_time.startswith('PT'):
+                   return start_time
+                # Check child element
+                child = run.first_child()
+                while child and not child.is_null():
+                    if child.name.endswith("startTime"):
+                        start_time = child.text(True, "")
+                        if start_time and not start_time.startswith('PT'):
+                            return start_time
+                    child = child.next_sibling()
+    except Exception as e:
+        logger.debug(f"Could not extract acquisition datetime from {file_path.name}: {e}")
+    
+    # Fallback: use file modification time
+    try:
+        mtime = file_path.stat().st_mtime
+        return datetime.fromtimestamp(mtime).isoformat()
+    except Exception:
+        pass
+    
+    return None
+
+
+
 def _decode_peaks_optimized(attrs: Dict[str, str], text: Optional[str]) -> tuple[np.ndarray, np.ndarray]:
     """
     KEY OPTIMIZATION: Decodes mz and intensity in A SINGLE operation
@@ -271,75 +331,149 @@ def _decode_peaks_optimized(attrs: Dict[str, str], text: Optional[str]) -> tuple
     return arr["mz"], arr["intensity"]
 
 
+
+# def iter_mzxml_fast(path: str | Path, *, decode_binary: bool = True) -> Iterator[Dict[str, Any]]:
+#     """
+#     Legacy lxml-based iterator for mzXML files.
+#     Kept for reference.
+#     """
+#     from lxml import etree
+#     path = Path(path)
+#     context = etree.iterparse(path.as_posix(), events=("start", "end"), remove_comments=True, huge_tree=False)
+#     _, root = next(context)
+#     current: Dict[str, Any] = {}
+#     
+#     for ev, elem in context:
+#         tag = elem.tag
+#         if '}' in tag:
+#             tag = tag.rsplit("}", 1)[-1]
+#             
+#         if ev == "start" and tag == "scan":
+#             attribs = elem.attrib
+#             pol = attribs.get("polarity")
+#             polarity = "Positive" if pol == "+" else ("Negative" if pol == "-" else None)
+#             
+#             current = {
+#                 "num": int(attribs.get("num", "0")),
+#                 "msLevel": int(attribs.get("msLevel", "1")),
+#                 "retentionTime": rt_to_seconds(attribs.get("retentionTime", "0")),
+#                 "polarity": polarity,
+#                 "filterLine": attribs.get("filterLine"),
+#                 "precursorMz": None,
+#                 "m/z array": np.array([], dtype=np.float32), 
+#                 "intensity array": np.array([], dtype=np.float32), 
+#             }
+#             
+#         elif ev == "end" and tag == "precursorMz":
+#             try:
+#                 current["precursorMz"] = float(elem.text)
+#             except (ValueError, TypeError):
+#                 pass
+#                 
+#         elif ev == "end" and tag == "peaks":
+#             if decode_binary:
+#                 mz, it = _decode_peaks_optimized(elem.attrib, (elem.text or "").strip() or None)
+#                 current["m/z array"] = mz
+#                 current["intensity array"] = it
+#                 
+#         elif ev == "end" and tag == "scan":
+#             yield current
+#             elem.clear()
+#             root.clear()
+
 def iter_mzxml_fast(path: str | Path, *, decode_binary: bool = True) -> Iterator[Dict[str, Any]]:
-    from lxml import etree  # CRITICAL IMPORT
-
     path = Path(path)
+    # pygixml implementation
+    doc = pygixml.parse_file(str(path))
+    
+    # Select all scan elements using root relative xpath
+    # Use first_child() to get the root element
+    try:
+        scans = doc.first_child().select_nodes("//*[local-name()='scan']")
+    except Exception:
+        # Fallback or error handling if file is empty/invalid
+        return
 
-    # KEY CHANGE: lxml.etree with remove_comments=True
-    context = etree.iterparse(
-        path.as_posix(),
-        events=("start", "end"),
-        remove_comments=True,  # Speeds up parsing
-        huge_tree=False,  # Security (default)
-    )
-
-    # Get root to clear memory
-    _, root = next(context)
-
-    current: Dict[str, Any] = {}
-    have_peaks = False
-
-    for ev, elem in context:
-        # lxml uses .tag directly (without namespace by default in mzXML)
-        tag = elem.tag
-        if '}' in tag:  # Only if there is a namespace
-            tag = tag.rsplit("}", 1)[-1]
-
-        if ev == "start" and tag == "scan":
-            a = elem.attrib
-            current = {
-                "num": int(a.get("num", "0")),
-                "msLevel": int(a.get("msLevel", "0")),
-                "retentionTime": rt_to_seconds(a.get("retentionTime", "0")),
-                "polarity": (
-                    "Positive" if a.get("polarity") == "+"
-                    else ("Negative" if a.get("polarity") == "-" else None)
-                ),
-                "filterLine": a.get("filterLine"),
-            }
-            have_peaks = False
-
-        elif ev == "end" and tag == "precursorMz":
-            txt = (elem.text or "").strip()
-            if txt:
+    # Use a shared list for reusing objects if optimizing further, but dict creation is fine
+    
+    for scan in scans:
+        scan = scan.node
+        current = {
+            "num": int(scan.attribute("num").value or "0"),
+            "msLevel": int(scan.attribute("msLevel").value or "0"),
+            "retentionTime": rt_to_seconds(scan.attribute("retentionTime").value),
+            "polarity": None,
+            "filterLine": scan.attribute("filterLine").value,
+            "precursorMz": None,
+            "m/z array": np.array([], dtype=np.float32), 
+            "intensity array": np.array([], dtype=np.float32)
+        }
+        
+        pol = scan.attribute("polarity").value
+        if pol == "+":
+            current["polarity"] = "Positive"
+        elif pol == "-":
+            current["polarity"] = "Negative"
+            
+        # Iterate children
+        child = scan.first_child()
+        while child and not child.is_null():
+            tag = child.name
+            
+            if tag.endswith("precursorMz"):
                 try:
-                    current["precursorMz"] = float(txt)
+                    current["precursorMz"] = float(child.text(True, ""))
                 except ValueError:
                     pass
+            elif tag.endswith("peaks"):
+                if decode_binary:
+                    # Attributes for decoding
+                    precision = child.attribute("precision").value
+                    byteOrder = child.attribute("byteOrder").value
+                    compressionType = child.attribute("compressionType").value
+                    
+                    attrs = {
+                        "precision": precision,
+                        "byteOrder": byteOrder, 
+                        "compressionType": compressionType
+                    }
+                    text = child.text(True, "")
+                    
+                    mz, inten = _decode_peaks_optimized(attrs, text)
+                    current["m/z array"] = mz
+                    current["intensity array"] = inten
+                else:
+                    # For non-decoded, we'd need to reconstruct the dict expected by callers
+                    # But the optimized decoder is default. 
+                    # If decode_binary is False existing code returned "peaks": {"attrs": ..., "text": ...}
+                    current["peaks"] = {
+                        "attrs": {
+                            "precision": child.attribute("precision").value,
+                            "byteOrder": child.attribute("byteOrder").value,
+                            "compressionType": child.attribute("compressionType").value
+                        }, 
+                        "text": child.text(True, "")
+                    }
 
-        elif ev == "end" and tag == "peaks":
-            if decode_binary:
-                # KEY OPTIMIZATION: Uses the optimized version
-                mz, it = _decode_peaks_optimized(elem.attrib, (elem.text or "").strip() or None)
-                current["m/z array"] = mz
-                current["intensity array"] = it
-                have_peaks = True
-            else:
-                current["peaks"] = {"attrs": dict(elem.attrib), "text": elem.text}
+            # ELMAVEN-like extra logic handled in loop in original, but here we construct current then yield
+            # The original logic had `elif ev == "end" and tag == "scan":` block for ELMAVEN
+            # We can do it here after parsing children
+            
+            child = child.next_sibling
+            
+        # ELMAVEN logic
+        if current.get("msLevel") == 2:
+            pol_str = current.get("polarity") or ""
+            prec = current.get("precursorMz")
+            mz_arr = current.get("m/z array", [])
+            mz0 = float(mz_arr[0]) if len(mz_arr) > 0 else None
+            if prec is not None and mz0 is not None:
+                current["filterLine_ELMAVEN"] = f"{pol_str} {prec:.3f} [{mz0:.3f}]"
 
-        elif ev == "end" and tag == "scan":
-            # ELMAVEN-like extra (optional)
-            if current.get("msLevel") == 2 and have_peaks:
-                pol_str = current.get("polarity") or ""
-                prec = current.get("precursorMz")
-                mz_arr = current.get("m/z array", [])
-                mz0 = float(mz_arr[0]) if len(mz_arr) else None
-                if prec is not None and mz0 is not None:
-                    current["filterLine_ELMAVEN"] = f"{pol_str} {prec:.3f} [{mz0:.3f}]"
-
-            yield current
-            root.clear()  # frees memory
+        yield current
+        # doc.reset() or element clearing not strictly needed with pygixml struct parsing as it loads dom
+        # but pygixml is fast. If memory is issue we might need iterative parser but pygixml is DOM-like.
+        # The benchmark showed it's fine.
 
 
 # =============================================================================
@@ -571,138 +705,221 @@ def write_mzml_from_spectra(
     tree.write(str(output_path), xml_declaration=True, encoding="UTF-8", pretty_print=True)
 
 
+
+# def iter_mzml_fast(path: str | Path, *, decode_binary: bool = True) -> Iterator[Dict[str, Any]]:
+#     """
+#     Legacy lxml-based iterator for mzML files.
+#     Kept for reference.
+#     """
+#     from lxml import etree
+#     path = Path(path)
+#     NS = "{http://psi.hupo.org/ms/mzml}"
+#     context = etree.iterparse(path.as_posix(), events=("start", "end"), remove_comments=True)
+#     _, root = next(context)
+#
+#     current: Dict[str, Any] = {}
+#     binary_arrays: List[Dict[str, Any]] = []
+#     current_binary: Dict[str, Any] = {}
+#
+#     for ev, elem in context:
+#         tag = elem.tag
+#         if tag.startswith(NS):
+#             tag = tag[len(NS):]
+#
+#         if ev == "start" and tag == "spectrum":
+#             attribs = elem.attrib
+#             index = attribs.get("index", "0")
+#             spec_id = attribs.get("id", "")
+#             scan_match = re.search(r'scan=(\d+)', spec_id)
+#             scan_num = int(scan_match.group(1)) if scan_match else int(index) + 1
+#             current = {
+#                 "num": scan_num,
+#                 "msLevel": 1,
+#                 "retentionTime": 0.0,
+#                 "polarity": None,
+#                 "filterLine": None,
+#                 "m/z array": np.array([], dtype=np.float64), 
+#                 "intensity array": np.array([], dtype=np.float64)
+#             }
+#             binary_arrays = []
+#
+#         elif ev == "end" and tag == "cvParam":
+#             accession = elem.get("accession", "")
+#             value = elem.get("value", "")
+#             if accession == CV_MS_LEVEL:
+#                 current["msLevel"] = int(value) if value else 1
+#             elif accession == CV_POSITIVE_SCAN:
+#                 current["polarity"] = "Positive"
+#             elif accession == CV_NEGATIVE_SCAN:
+#                 current["polarity"] = "Negative"
+#             elif accession == CV_SCAN_START_TIME:
+#                 unit_name = elem.get("unitName", "second")
+#                 time_val = float(value) if value else 0.0
+#                 if unit_name == "minute":
+#                     time_val *= 60.0
+#                 current["retentionTime"] = time_val
+#             elif accession == CV_32BIT_FLOAT:
+#                 current_binary["is_64bit"] = False
+#             elif accession == CV_64BIT_FLOAT:
+#                 current_binary["is_64bit"] = True
+#             elif accession == CV_ZLIB_COMPRESSION:
+#                 current_binary["is_compressed"] = True
+#             elif accession == CV_NO_COMPRESSION:
+#                 current_binary["is_compressed"] = False
+#             elif accession == CV_MZ_ARRAY:
+#                 current_binary["type"] = "mz"
+#             elif accession == CV_INTENSITY_ARRAY:
+#                 current_binary["type"] = "intensity"
+#
+#         elif ev == "start" and tag == "binaryDataArray":
+#             current_binary = {
+#                 "is_64bit": True,
+#                 "is_compressed": False,
+#                 "type": None,
+#                 "data": None,
+#             }
+#
+#         elif ev == "end" and tag == "binary":
+#             current_binary["data"] = elem.text
+#
+#         elif ev == "end" and tag == "binaryDataArray":
+#             if decode_binary and current_binary.get("data"):
+#                 arr = _decode_binary_mzml(
+#                     current_binary["data"],
+#                     is_64bit=current_binary.get("is_64bit", True),
+#                     is_compressed=current_binary.get("is_compressed", False),
+#                 )
+#                 current_binary["array"] = arr
+#             binary_arrays.append(current_binary)
+#             current_binary = {}
+#
+#         elif ev == "end" and tag == "spectrum":
+#             mz_array = np.array([], dtype=np.float64)
+#             intensity_array = np.array([], dtype=np.float64)
+#             for ba in binary_arrays:
+#                 if ba.get("type") == "mz" and "array" in ba:
+#                     mz_array = ba["array"].astype(np.float64)
+#                 elif ba.get("type") == "intensity" and "array" in ba:
+#                     intensity_array = ba["array"].astype(np.float64)
+#             current["m/z array"] = mz_array
+#             current["intensity array"] = intensity_array
+#             yield current
+#             elem.clear()
+#             root.clear()
+
 def iter_mzml_fast(path: str | Path, *, decode_binary: bool = True) -> Iterator[Dict[str, Any]]:
-    """
-    Fast lxml-based iterator for mzML files.
-
-    Similar to iter_mzxml_fast but handles mzML-specific structure:
-    - Separate binaryDataArray elements for m/z and intensity
-    - CV terms for metadata (compression, precision, polarity, etc.)
-    - Always has namespace that must be stripped
-
-    ~2x faster than pyteomics-based iter_mzml_pyteomics.
-
-    Args:
-        path: Path to mzML file
-        decode_binary: If True, decode binary arrays to numpy arrays
-
-    Yields:
-        Dictionary with spectrum data (same format as iter_mzxml_fast)
-    """
-    from lxml import etree
-
     path = Path(path)
-    NS = "{http://psi.hupo.org/ms/mzml}"
+    # pygixml implementation
+    doc = pygixml.parse_file(str(path))
+    
+    # Select all spectrum elements
+    # Using local-name() is safer to avoid namespace issues in XPath
+    try:
+        spectra = doc.first_child().select_nodes("//*[local-name()='spectrum']")
+    except Exception:
+        return
+    
+    for spectrum in spectra:
+        spectrum = spectrum.node
+        current = {
+            "num": 0,
+            "msLevel": 1,
+            "retentionTime": 0.0,
+            "polarity": None,
+            "filterLine": None,
+            "m/z array": np.array([], dtype=np.float64), 
+            "intensity array": np.array([], dtype=np.float64)
+        }
+        
+        # Attributes
+        spec_id = spectrum.attribute("id").value or ""
+        index = spectrum.attribute("index").value or "0"
+        
+        # Scan number
+        scan_match = re.search(r'scan=(\d+)', spec_id)
+        current["num"] = int(scan_match.group(1)) if scan_match else int(index) + 1
+        
+        # We need to traverse children: cvParam, scanList, binaryDataArrayList
+        # pygixml traversal:
+        child = spectrum.first_child()
+        while child and not child.is_null():
+            tag = child.name
+            
+            if tag.endswith("cvParam"):
+                acc = child.attribute("accession").value
+                val = child.attribute("value").value
+                if acc == CV_MS_LEVEL:
+                    current["msLevel"] = int(val) if val else 1
+                elif acc == CV_POSITIVE_SCAN:
+                    current["polarity"] = "Positive"
+                elif acc == CV_NEGATIVE_SCAN:
+                    current["polarity"] = "Negative"
+            
+            elif tag.endswith("scanList"):
+                grandchild = child.first_child()
+                while grandchild and not grandchild.is_null():
+                    if grandchild.name.endswith("scan"):
+                        ggchild = grandchild.first_child()
+                        while ggchild and not ggchild.is_null():
+                            if ggchild.name.endswith("cvParam"):
+                                acc = ggchild.attribute("accession").value
+                                if acc == CV_SCAN_START_TIME:
+                                    unit_name = ggchild.attribute("unitName").value
+                                    val = ggchild.attribute("value").value
+                                    time_val = float(val) if val else 0.0
+                                    if unit_name == "minute":
+                                        time_val *= 60.0
+                                    current["retentionTime"] = time_val
+                            ggchild = ggchild.next_sibling
+                    grandchild = grandchild.next_sibling
+            
+            elif tag.endswith("binaryDataArrayList"):
+                bd_child = child.first_child()
+                while bd_child and not bd_child.is_null():
+                    if bd_child.name.endswith("binaryDataArray"):
+                        b_is_64bit = True
+                        b_is_compressed = False
+                        b_type = None
+                        b_data = None
+                        
+                        b_param = bd_child.first_child()
+                        while b_param and not b_param.is_null():
+                            b_tag = b_param.name
+                            if b_tag.endswith("cvParam"):
+                                acc = b_param.attribute("accession").value
+                                if acc == CV_32BIT_FLOAT:
+                                    b_is_64bit = False
+                                elif acc == CV_64BIT_FLOAT:
+                                    b_is_64bit = True
+                                elif acc == CV_ZLIB_COMPRESSION:
+                                    b_is_compressed = True
+                                elif acc == CV_NO_COMPRESSION:
+                                    b_is_compressed = False
+                                elif acc == CV_MZ_ARRAY:
+                                    b_type = "mz"
+                                elif acc == CV_INTENSITY_ARRAY:
+                                    b_type = "intensity"
+                            elif b_tag.endswith("binary"):
+                                b_data = b_param.text(True, "") 
+                            
+                            b_param = b_param.next_sibling
+                        
+                        if decode_binary and b_data:
+                            arr = _decode_binary_mzml(
+                                b_data,
+                                is_64bit=b_is_64bit,
+                                is_compressed=b_is_compressed,
+                            )
+                            if b_type == "mz":
+                                current["m/z array"] = arr
+                            elif b_type == "intensity":
+                                current["intensity array"] = arr
+                                
+                    bd_child = bd_child.next_sibling
 
-    context = etree.iterparse(
-        path.as_posix(),
-        events=("start", "end"),
-        remove_comments=True,
-    )
-
-    # Get root for memory cleanup
-    _, root = next(context)
-
-    current: Dict[str, Any] = {}
-    binary_arrays: List[Dict[str, Any]] = []
-    current_binary: Dict[str, Any] = {}
-
-    for ev, elem in context:
-        # Strip namespace
-        tag = elem.tag
-        if tag.startswith(NS):
-            tag = tag[len(NS):]
-
-        if ev == "start" and tag == "spectrum":
-            # Start of new spectrum
-            attribs = elem.attrib
-            index = attribs.get("index", "0")
-            spec_id = attribs.get("id", "")
-            # Extract scan number from id like "controllerType=0 controllerNumber=1 scan=4"
-            scan_match = re.search(r'scan=(\d+)', spec_id)
-            scan_num = int(scan_match.group(1)) if scan_match else int(index) + 1
-
-            current = {
-                "num": scan_num,
-                "msLevel": 1,  # Default, will be updated from cvParam
-                "retentionTime": 0.0,
-                "polarity": None,
-                "filterLine": None,
-            }
-            binary_arrays = []
-
-        elif ev == "end" and tag == "cvParam":
-            # Parse CV parameters
-            accession = elem.get("accession", "")
-            value = elem.get("value", "")
-
-            if accession == CV_MS_LEVEL:
-                current["msLevel"] = int(value) if value else 1
-            elif accession == CV_POSITIVE_SCAN:
-                current["polarity"] = "Positive"
-            elif accession == CV_NEGATIVE_SCAN:
-                current["polarity"] = "Negative"
-            elif accession == CV_SCAN_START_TIME:
-                # Get scan time - check units
-                unit_name = elem.get("unitName", "second")
-                time_val = float(value) if value else 0.0
-                if unit_name == "minute":
-                    time_val *= 60.0
-                current["retentionTime"] = time_val
-            elif accession == CV_32BIT_FLOAT:
-                current_binary["is_64bit"] = False
-            elif accession == CV_64BIT_FLOAT:
-                current_binary["is_64bit"] = True
-            elif accession == CV_ZLIB_COMPRESSION:
-                current_binary["is_compressed"] = True
-            elif accession == CV_NO_COMPRESSION:
-                current_binary["is_compressed"] = False
-            elif accession == CV_MZ_ARRAY:
-                current_binary["type"] = "mz"
-            elif accession == CV_INTENSITY_ARRAY:
-                current_binary["type"] = "intensity"
-
-        elif ev == "start" and tag == "binaryDataArray":
-            # Reset for new binary array
-            current_binary = {
-                "is_64bit": True,
-                "is_compressed": False,
-                "type": None,
-                "data": None,
-            }
-
-        elif ev == "end" and tag == "binary":
-            # Store binary text
-            current_binary["data"] = elem.text
-
-        elif ev == "end" and tag == "binaryDataArray":
-            # Complete binary array - decode if requested
-            if decode_binary and current_binary.get("data"):
-                arr = _decode_binary_mzml(
-                    current_binary["data"],
-                    is_64bit=current_binary.get("is_64bit", True),
-                    is_compressed=current_binary.get("is_compressed", False),
-                )
-                current_binary["array"] = arr
-            binary_arrays.append(current_binary)
-            current_binary = {}
-
-        elif ev == "end" and tag == "spectrum":
-            # End of spectrum - assemble result
-            mz_array = np.array([], dtype=np.float64)
-            intensity_array = np.array([], dtype=np.float64)
-
-            for ba in binary_arrays:
-                if ba.get("type") == "mz" and "array" in ba:
-                    mz_array = ba["array"].astype(np.float64)
-                elif ba.get("type") == "intensity" and "array" in ba:
-                    intensity_array = ba["array"].astype(np.float64)
-
-            current["m/z array"] = mz_array
-            current["intensity array"] = intensity_array
-
-            yield current
-            root.clear()
+            child = child.next_sibling
+            
+        yield current
 
 BATCH_SIZE_POINTS = 500_000
 
@@ -861,8 +1078,6 @@ def convert_mzxml_to_parquet_fast_batches(
             if total_points >= batch_size_points:
                 flush_batch()
             # --- END BATCH LOGIC ---
-    except XMLSyntaxError as e:
-        raise ValueError(f"Invalid XML in {file_path}: {str(e)}") from e
     except Exception as e:
         raise ValueError(f"Invalid XML in {file_path}: {e}") from e
     else:
@@ -873,7 +1088,7 @@ def convert_mzxml_to_parquet_fast_batches(
 
     if not wrote_data:
         logger.warning(f"No valid data found in {file_path}")
-        return 0, file_path, file_stem, 1, "Unknown", None
+        return 0, file_path, file_stem, 1, "Unknown", None, None
 
     if ms_level is None:
         ms_level = 1
@@ -886,7 +1101,10 @@ def convert_mzxml_to_parquet_fast_batches(
         except OSError:
             pass
 
-    return file_path, file_stem, ms_level, polarity, tmp_fn.as_posix()
+    # Extract acquisition datetime from file header
+    acq_datetime = get_acquisition_datetime(file_path)
+
+    return file_path, file_stem, ms_level, polarity, tmp_fn.as_posix(), acq_datetime
 
 
 def _scan_id_from_mzml(spectrum: Dict[str, Any]) -> int:
@@ -1038,7 +1256,7 @@ def convert_mzml_to_parquet_fast_batches(
 
     if not wrote_data:
         logger.warning(f"No valid data found in {file_path}")
-        return 0, file_path, file_stem, 1, "Unknown", None
+        return 0, file_path, file_stem, 1, "Unknown", None, None
 
     if ms_level is None:
         ms_level = 1
@@ -1051,7 +1269,10 @@ def convert_mzml_to_parquet_fast_batches(
         except OSError:
             pass
 
-    return file_path, file_stem, ms_level, polarity, tmp_fn.as_posix()
+    # Extract acquisition datetime from file header
+    acq_datetime = get_acquisition_datetime(file_path)
+
+    return file_path, file_stem, ms_level, polarity, tmp_fn.as_posix(), acq_datetime
 
 
 
@@ -1216,6 +1437,7 @@ def get_targets_v2(files_path):
                     elif has_rt and not has_rt_min and not has_rt_max:
                         target['rt_min'] = target['rt'] - DEFAULT_RT_WINDOW
                         target['rt_max'] = target['rt'] + DEFAULT_RT_WINDOW
+                        target['rt_auto_adjusted'] = True  # Mark for data-driven optimization
                         logging.debug(
                             f"Target '{target['peak_label']}': Derived rt_min={target['rt_min']:.2f} "
                             f"and rt_max={target['rt_max']:.2f} from rt={target['rt']:.2f} (±{DEFAULT_RT_WINDOW}s)"
@@ -1225,6 +1447,7 @@ def get_targets_v2(files_path):
                     elif has_rt and has_rt_min and not has_rt_max:
                         window = abs(target['rt'] - target['rt_min'])
                         target['rt_max'] = target['rt'] + window
+                        target['rt_auto_adjusted'] = True  # Mark for data-driven optimization of rt_max
                         logging.debug(
                             f"Target '{target['peak_label']}': Derived rt_max={target['rt_max']:.2f} "
                             f"from rt={target['rt']:.2f} and rt_min={target['rt_min']:.2f} (window={window:.2f}s)"
@@ -1234,6 +1457,7 @@ def get_targets_v2(files_path):
                     elif has_rt and has_rt_max and not has_rt_min:
                         window = abs(target['rt_max'] - target['rt'])
                         target['rt_min'] = target['rt'] - window
+                        target['rt_auto_adjusted'] = True  # Mark for data-driven optimization of rt_min
                         logging.debug(
                             f"Target '{target['peak_label']}': Derived rt_min={target['rt_min']:.2f} "
                             f"from rt={target['rt']:.2f} and rt_max={target['rt_max']:.2f} (window={window:.2f}s)"
@@ -1276,7 +1500,7 @@ def get_targets_v2(files_path):
                     
                     # Warn if window is suspiciously large
                     window_size = target['rt_max'] - target['rt_min']
-                    if window_size > 30.0:
+                    if window_size > 60.0:
                         logging.warning(
                             f"Target '{target['peak_label']}': Large RT window ({window_size:.1f}s). "
                             f"Please verify rt_min and rt_max values."
@@ -1455,7 +1679,7 @@ def get_targets_v2(files_path):
     return targets_df[ref_names], failed_files, failed_targets, stats
 
 
-def _insert_ms_data(wdir, ms_type, batch_ms, batch_ms_data):
+def _insert_ms_data(wdir, ms_type, batch_ms, batch_ms_data, n_cpus=None):
     failed_files = []
 
     if not batch_ms[ms_type]:
@@ -1463,31 +1687,38 @@ def _insert_ms_data(wdir, ms_type, batch_ms, batch_ms_data):
 
     pldf = pd.DataFrame(
         batch_ms[ms_type],
-        columns=['ms_file_label', 'label', 'ms_type', 'polarity', 'file_type'],
+        columns=['ms_file_label', 'label', 'ms_type', 'polarity', 'file_type', 'acquisition_datetime'],
     )
 
+    # Auto-detect sample type and color in bulk before insertion
+    from .plugins.ms_files import detect_sample_color
+    
+    # helper wrapper to unpack tuple
+    def _get_meta(label):
+        c, t = detect_sample_color(label)
+        return (c or '#BBBBBB', t or 'Sample')
+        
+    # Apply to DataFrame
+    meta = pldf['ms_file_label'].apply(_get_meta)
+    pldf['color'] = [m[0] for m in meta]
+    pldf['sample_type'] = [m[1] for m in meta]
+    
     parquet_files_to_delete = batch_ms_data[ms_type].copy()
     insert_success = False
     
-    with duckdb_connection(wdir) as conn:
+    with duckdb_connection(wdir, n_cpus=n_cpus) as conn:
         if conn is None:
             raise PreventUpdate
         try:
-            conn.execute(
-                "INSERT INTO samples(ms_file_label, label, ms_type, polarity, file_type) "
-                "SELECT ms_file_label, label, ms_type, polarity, file_type FROM pldf"
-            )
+            # Performance tuning:
+            # 1. Increase WAL limit to reduce disk flushes
+            conn.execute("SET wal_autocheckpoint='1GB'")
             
-            # Auto-detect sample type from filename and assign colors
-            from .plugins.ms_files import detect_sample_color
-            for file_label in pldf['ms_file_label'].to_list():
-                color, sample_type = detect_sample_color(file_label)
-                if color:
-                    conn.execute(
-                        "UPDATE samples SET color = ?, sample_type = ? WHERE ms_file_label = ?",
-                        [color, sample_type, file_label]
-                    )
-                    logging.debug(f"Auto-detected '{file_label}' as {sample_type}, assigned color {color}")
+            # Insert with all metadata columns populated
+            conn.execute(
+                "INSERT INTO samples(ms_file_label, label, ms_type, polarity, file_type, color, sample_type, acquisition_datetime) "
+                "SELECT ms_file_label, label, ms_type, polarity, file_type, color, sample_type, acquisition_datetime FROM pldf"
+            )
             
             ms_data_table = f'{ms_type}_data'
             extra_columns = ['mz_precursor', 'filterLine', 'filterLine_ELMAVEN']
@@ -1500,6 +1731,9 @@ def _insert_ms_data(wdir, ms_type, batch_ms, batch_ms_data):
                          FROM read_parquet(?)
                          """,
                          [batch_ms_data[ms_type]])
+            
+            # CHECKPOINT after each batch to flush WAL and keep insert times consistent
+            conn.execute("CHECKPOINT")
             insert_success = True
                     
         except Exception as e:
@@ -1519,14 +1753,19 @@ def _insert_ms_data(wdir, ms_type, batch_ms, batch_ms_data):
 
 # IMPORTANT: We've defined these functions here temporarily, but it should be moved to the backend.
 def process_ms_files(wdir, set_progress, selected_files, n_cpus):
-    def _send_progress(percent, detail=""):
+    def _send_progress(percent, stage="Processing", detail=""):
         if not set_progress:
             return
         try:
-            set_progress(percent, detail)
+            set_progress(percent, stage, detail)
         except TypeError:
             try:
-                set_progress(percent)
+                set_progress(percent, detail)
+            except TypeError:
+                try:
+                    set_progress(percent)
+                except Exception:
+                    pass
             except Exception:
                 pass
 
@@ -1534,7 +1773,9 @@ def process_ms_files(wdir, set_progress, selected_files, n_cpus):
     n_total = len(file_list)
     failed_files = []
     duplicates_count = 0
-    total_processed = 0
+    total_processed = 0 # Files committed to DB
+    n_converted = 0     # Files processed by CPU (for smooth progress bar)
+    last_batch_time = None
     import concurrent.futures
     import time
 
@@ -1576,49 +1817,68 @@ def process_ms_files(wdir, set_progress, selected_files, n_cpus):
         chunk_size = 64  # Max files in-flight at once
         batch_ms = {'ms1': [], 'ms2': []}
         batch_ms_data = {'ms1': [], 'ms2': []}
-        batch_size = n_cpus
+        # Decouple DB batch size from CPU count for fewer transactions
+        batch_size = 100
         total_batches = (total_to_process + batch_size - 1) // batch_size
         batch_num = 0
         batch_start = time.time()
-        
-        with tempfile.TemporaryDirectory(dir=workspace_temp) as tmpdir:
+
+        # Prepare ThreadPoolExecutor for DB writes (max_workers=1 to ensure serial writes)
+        # pipeline depth of 1: We convert batch N while writing batch N-1.
+        with tempfile.TemporaryDirectory(dir=workspace_temp) as tmpdir, \
+             concurrent.futures.ThreadPoolExecutor(max_workers=1) as db_executor, \
+             concurrent.futures.ProcessPoolExecutor(max_workers=n_cpus) as executor: # Reuse process pool!
+
+            db_future = None  # Holds the future of the *previous* batch insertion
+
+            # Helper to handle DB result processing
+            def process_db_result(future):
+                nonlocal total_processed, failed_files
+                try:
+                    b_processed, b_failed = future.result()
+                    total_processed += b_processed
+                    failed_files.extend(b_failed)
+                    return b_processed
+                except Exception as e:
+                    logger.error(f"Async DB Insert Failed: {e}")
+                    return 0
+
             # Process files in chunks
             for chunk_start in range(0, len(files_to_process), chunk_size):
                 chunk_end = min(chunk_start + chunk_size, len(files_to_process))
                 chunk_files = files_to_process[chunk_start:chunk_end]
                 
-                with concurrent.futures.ProcessPoolExecutor(
-                    max_workers=min(n_cpus, len(chunk_files)), 
-                    mp_context=None
-                ) as executor:
-                    futures_name = {
-                        executor.submit(
-                            convert_ms_file_to_parquet_fast_batches, file_path, tmp_dir=tmpdir
-                        ): file_path
-                        for file_path in chunk_files
-                    }
-                    
-                    for future in concurrent.futures.as_completed(futures_name.keys()):
+                futures_name = {
+                    executor.submit(
+                        convert_ms_file_to_parquet_fast_batches, file_path, tmp_dir=tmpdir
+                    ): file_path
+                    for file_path in chunk_files
+                }
+                
+                for future in concurrent.futures.as_completed(futures_name.keys()):
                         try:
                             result = future.result()
                         except Exception as e:
                             failed_files.append({futures_name[future]: str(e)})
-                            total_processed += 1
-                            done_count = total_processed + len(failed_files) + duplicates_count
-                            _send_progress(round(done_count / n_total * 100, 1))
+                            n_converted += 1
+                            done_count = n_converted + duplicates_count
+                            _send_progress(round(done_count / n_total * 100, 1), stage="Processing", detail="Processing files...")
                             logger.error(f"Failed: {Path(futures_name[future]).name} ({e})")
                             continue
 
-                        _file_path, _ms_file_label, _ms_level, _polarity, _parquet_df = result
+                        _file_path, _ms_file_label, _ms_level, _polarity, _parquet_df, _acq_datetime = result
                         
                         if _parquet_df is None:
                             failed_files.append({_file_path: "No valid data found or conversion failed"})
-                            total_processed += 1
-                            done_count = total_processed + len(failed_files) + duplicates_count
-                            _send_progress(round(done_count / n_total * 100, 1))
+                            n_converted += 1
+                            done_count = n_converted + duplicates_count
+                            _send_progress(round(done_count / n_total * 100, 1), stage="Processing", detail="Processing files...")
                             logger.warning(f"Failed (no data): {Path(_file_path).name}")
                             continue
 
+                        # Success handling
+                        n_converted += 1
+                        
                         suffix = Path(_file_path).suffix.lower()
                         if suffix == ".mzxml":
                             file_type = "mzXML"
@@ -1627,105 +1887,181 @@ def process_ms_files(wdir, set_progress, selected_files, n_cpus):
                         else:
                             file_type = suffix.lstrip(".")
                         batch_ms[f'ms{_ms_level}'].append(
-                            (_ms_file_label, _ms_file_label, f'ms{_ms_level}', _polarity, file_type)
+                            (_ms_file_label, _ms_file_label, f'ms{_ms_level}', _polarity, file_type, _acq_datetime)
                         )
+
                         batch_ms_data[f'ms{_ms_level}'].append(_parquet_df)
+                        
+                        # Update progress bar smoothly (file by file)
+                        done_count = n_converted + duplicates_count
+                        pct = round(done_count / n_total * 100, 1)
+                        # We can show detailed text if we want, or keep it generic until batch finishes
+                        # Showing batch info here might be wrong since batch_num updates later?
+                        # Let's show generic "Processing file X/Y" or similar
+                        detail_text = (
+                            f"Batch {batch_num+1}/{total_batches} | "
+                            f"Progress {done_count}/{n_total}"
+                        )
+                        if last_batch_time is not None:
+                             detail_text += f" | Time/batch {last_batch_time:.2f}s"
+
+                        _send_progress(pct, stage="Processing", detail=detail_text)
 
                         if len(batch_ms['ms1']) == batch_size:
-                            b_processed, b_failed = _insert_ms_data(wdir, 'ms1', batch_ms, batch_ms_data)
+                            # 1. Wait for previous DB write to finish (pipelining)
+                            if db_future:
+                                process_db_result(db_future)
+
+                            # 2. Submit new batch (COPY data so main thread can reuse lists)
+                            # Deep copy not needed for list of strings/tuples, shallow copy of list is fine
+                            # But we need new lists for next batch in main thread
+                            batch_ms_copy = {'ms1': batch_ms['ms1'], 'ms2': []} # MS2 is separate triggering
+                            batch_data_copy = {'ms1': batch_ms_data['ms1'], 'ms2': []}
+
+                            t_insert_start = time.time() # This timestamp is less meaningful now, denotes submit time
+                            db_future = db_executor.submit(_insert_ms_data, wdir, 'ms1', batch_ms_copy, batch_data_copy, n_cpus=4)
+
                             batch_elapsed = time.time() - batch_start
-                            total_processed += b_processed
-                            failed_files.extend(b_failed)
+                            last_batch_time = batch_elapsed # Update for next batch display
 
                             batch_num += 1
                             detail = (
                                 f"Batch {batch_num}/{total_batches} | "
-                                f"Progress {total_processed:,}/{total_to_process:,} | "
-                                f"Time/batch {batch_elapsed:0.2f}s"
+                                f"Progress {done_count}/{n_total} | "
+                                f"Time/batch {batch_elapsed:.2f}s"
                             )
-                            done_count = total_processed + len(failed_files) + duplicates_count
-                            _send_progress(round(done_count / n_total * 100, 1), detail)
+                            # Ensure we don't send > 100% or anything weird, though n_converted handles it
+                            _send_progress(pct, stage="Processing", detail=detail)
                             logger.info(detail)
+
                             batch_ms['ms1'] = []
                             batch_ms_data['ms1'] = []
                             batch_start = time.time()
-                            
-                            # Periodic CHECKPOINT every 20 batches
+
+                            # Periodic CHECKPOINT every 20 batches (Sync check)
                             if batch_num % 20 == 0:
+                                # Must wait for pending DB operations before checkpointing
+                                if db_future:
+                                    process_db_result(db_future)
+                                    db_future = None
                                 with duckdb_connection(wdir) as conn:
                                     if conn is not None:
                                         conn.execute("CHECKPOINT")
                                         logger.info(f"Checkpoint after batch {batch_num}")
 
                         elif len(batch_ms['ms2']) == batch_size:
-                            b_processed, b_failed = _insert_ms_data(wdir, 'ms2', batch_ms, batch_ms_data)
+                             # 1. Wait for previous DB write
+                            if db_future:
+                                process_db_result(db_future)
+
+                            batch_ms_copy = {'ms1': [], 'ms2': batch_ms['ms2']}
+                            batch_data_copy = {'ms1': [], 'ms2': batch_ms_data['ms2']}
+
+                            db_future = db_executor.submit(_insert_ms_data, wdir, 'ms2', batch_ms_copy, batch_data_copy, n_cpus=4)
+
                             batch_elapsed = time.time() - batch_start
-                            total_processed += b_processed
-                            failed_files.extend(b_failed)
 
                             batch_num += 1
                             detail = (
                                 f"Batch {batch_num}/{total_batches} | "
-                                f"Progress {total_processed:,}/{total_to_process:,} | "
-                                f"Time/batch {batch_elapsed:0.2f}s"
+                                f"Conv Time: {batch_elapsed:0.2f}s | "
+                                f"DB: Async"
                             )
                             done_count = total_processed + len(failed_files) + duplicates_count
                             _send_progress(round(done_count / n_total * 100, 1), detail)
                             logger.info(detail)
+
                             batch_ms['ms2'] = []
                             batch_ms_data['ms2'] = []
                             batch_start = time.time()
-                            
+
                             # Periodic CHECKPOINT every 20 batches
                             if batch_num % 20 == 0:
+                                if db_future:
+                                    process_db_result(db_future)
+                                    db_future = None
                                 with duckdb_connection(wdir) as conn:
                                     if conn is not None:
                                         conn.execute("CHECKPOINT")
                                         logger.info(f"Checkpoint after batch {batch_num}")
-            
-            # Process remaining items in batches
+
+            # Flush remaining batches
+            # 1. Wait for any pending async write
+            _send_progress(99.0, stage="Finalizing", detail="Finishing background tasks...")
+            t_wait_start = time.time()
+            if db_future:
+                process_db_result(db_future)
+                db_future = None
+            wait_time = time.time() - t_wait_start
+
+            # 2. Process remaining items synchronously (or async and wait)
             if len(batch_ms['ms1']):
-                b_processed, b_failed = _insert_ms_data(wdir, 'ms1', batch_ms, batch_ms_data)
+                _send_progress(99.5, stage="Finalizing", detail="Saving last batch (MS1)...")
+                t_insert_start = time.time()
+                b_processed, b_failed = _insert_ms_data(wdir, 'ms1', batch_ms, batch_ms_data, n_cpus=4)
+                t_insert_end = time.time()
+                
                 batch_elapsed = time.time() - batch_start
+                insert_time = t_insert_end - t_insert_start
+                conv_time = batch_elapsed - insert_time - wait_time
+                
                 total_processed += b_processed
                 failed_files.extend(b_failed)
-
+                
                 batch_num += 1
                 detail = (
                     f"Batch {batch_num}/{total_batches} | "
-                    f"Progress {total_processed:,}/{total_to_process:,} | "
-                    f"Time/batch {batch_elapsed:0.2f}s"
+                    f"Files {done_count}/{n_total}"
                 )
-                done_count = total_processed + len(failed_files) + duplicates_count
-                _send_progress(round(done_count / n_total * 100, 1), detail)
-                logger.info(detail)
+                done_count = n_converted + duplicates_count
+                _send_progress(round(done_count / n_total * 100, 1), stage="Processing", detail=detail)
+                
+                log_detail = (
+                    f"Batch {batch_num}/{total_batches} | "
+                    f"Conv: {conv_time:0.2f}s | "
+                    f"Wait: {wait_time:0.2f}s | "
+                    f"DB: {insert_time:0.2f}s (Sync Flush)"
+                )
+                logger.info(log_detail)
+
                 batch_ms['ms1'] = []
                 batch_ms_data['ms1'] = []
-
+                
             if len(batch_ms['ms2']):
-                b_processed, b_failed = _insert_ms_data(wdir, 'ms2', batch_ms, batch_ms_data)
+                _send_progress(99.5, stage="Finalizing", detail="Saving last batch (MS2)...")
+                t_insert_start = time.time()
+                b_processed, b_failed = _insert_ms_data(wdir, 'ms2', batch_ms, batch_ms_data, n_cpus=4)
+                t_insert_end = time.time()
+                
                 batch_elapsed = time.time() - batch_start
+                insert_time = t_insert_end - t_insert_start
+                conv_time = batch_elapsed - insert_time - wait_time
+
                 total_processed += b_processed
                 failed_files.extend(b_failed)
-
+                
                 batch_num += 1
                 detail = (
                     f"Batch {batch_num}/{total_batches} | "
-                    f"Progress {total_processed:,}/{total_to_process:,} | "
-                    f"Time/batch {batch_elapsed:0.2f}s"
+                    f"Files {done_count}/{n_total}"
                 )
-                done_count = total_processed + len(failed_files) + duplicates_count
-                _send_progress(round(done_count / n_total * 100, 1), detail)
-                logger.info(detail)
+                done_count = n_converted + duplicates_count
+                _send_progress(round(done_count / n_total * 100, 1), stage="Processing", detail=detail)
+                
+                log_detail = (
+                    f"Batch {batch_num}/{total_batches} | "
+                    f"Conv: {conv_time:0.2f}s | "
+                    f"Wait: {wait_time:0.2f}s | "
+                    f"DB: {insert_time:0.2f}s (Sync Flush)"
+                )
+                logger.info(log_detail)
+                
                 batch_ms['ms2'] = []
                 batch_ms_data['ms2'] = []
 
-    _send_progress(round(100, 1))
-    elapsed = time.perf_counter() - start_time
-    logger.info(
-        f"Completed MS file processing. Success: {total_processed}, "
-        f"Failed: {len(failed_files)}. Total time: {elapsed:0.2f}s."
-    )
+    total_elapsed = time.perf_counter() - start_time
+    logger.info(f"Completed MS file processing. Success: {total_processed}, Failed: {len(failed_files)}. Total time: {total_elapsed:0.2f}s.")
+    _send_progress(100, stage="Processing", detail=f"Done. Processed {total_processed} files.")
     
     # Clean up the workspace's temp folder
     workspace_temp = Path(wdir) / "data" / "temp"

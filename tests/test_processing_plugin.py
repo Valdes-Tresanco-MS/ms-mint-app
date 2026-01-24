@@ -704,7 +704,7 @@ class TestStandaloneFunctions:
             assert download == dash.no_update
             assert isinstance(notification, fac.AntdNotification)
             assert notification.type == "warning"
-            assert "at least one result column" in notification.description
+            assert "Select at least one column." in notification.description
         
         def test_empty_columns_list(self):
             """Should return warning notification if empty list."""
@@ -719,7 +719,7 @@ class TestStandaloneFunctions:
             
             assert download == dash.no_update
             assert notification.type == "warning"
-            assert "No valid result columns" in notification.description
+            assert "No valid columns selected." in notification.description
         
         @patch('ms_mint_app.plugins.processing.duckdb_connection')
         def test_database_connection_failure(self, mock_conn):
@@ -730,30 +730,25 @@ class TestStandaloneFunctions:
             
             assert download == dash.no_update
             assert notification.type == "error"
-            assert "Could not open the results database" in notification.description
+            assert "Database unavailable." in notification.description
         
         @patch('ms_mint_app.plugins.processing.duckdb_connection')
-        @patch('ms_mint_app.plugins.processing.dcc.send_data_frame')
+        @patch('ms_mint_app.plugins.processing.dcc.send_file')
         def test_successful_download(self, mock_send, mock_conn):
             """Should successfully download with valid columns."""
-            import pandas as pd
+            mock_send.return_value = "mock_file_download"
             
-            # Mock database query
-            mock_df = pd.DataFrame({
-                'peak_label': ['Peak1', 'Peak2'],
-                'ms_file_label': ['File1', 'File2'],
-                'ms_type': ['ms1', 'ms1'],
-                'peak_area': [1000.0, 2000.0]
-            })
-            mock_conn.return_value.__enter__.return_value.execute.return_value.df.return_value = mock_df
-            mock_send.return_value = "mock_download"
+            # Mock DB execute to return None (copy command returns nothing or count)
+            # The download uses COPY to file, so no DF returned
+            mock_conn.return_value.__enter__.return_value.execute.return_value = None
             
             download, notification = _download_all_results("/fake/wdir", "TestWorkspace", ['peak_area', 'peak_mean'])
             
-            assert download == "mock_download"
+            assert download == "mock_file_download"
             assert notification == dash.no_update
-            # Verify send_data_frame was called
             assert mock_send.called
+            # Verify temporary file usage
+            assert mock_send.call_args[0][0].endswith('.csv')
     
     class TestDownloadDenseMatrix:
         """Test suite for _download_dense_matrix() standalone function."""
@@ -764,7 +759,7 @@ class TestStandaloneFunctions:
             
             assert download == dash.no_update
             assert notification.type == "warning"
-            assert "row, column, and value fields" in notification.description
+            assert "Missing row, column, or value selection." in notification.description
         
         def test_missing_cols_parameter(self):
             """Should return warning if cols not provided."""
@@ -791,7 +786,7 @@ class TestStandaloneFunctions:
             
             assert download == dash.no_update
             assert notification.type == "warning"
-            assert "Invalid row/column selection" in notification.description
+            assert "Invalid row/column selection." in notification.description
         
         def test_invalid_value_column(self):
             """Should return warning if invalid value column."""
@@ -818,7 +813,7 @@ class TestStandaloneFunctions:
             
             assert download == dash.no_update
             assert notification.type == "error"
-            assert "Could not open the results database" in notification.description
+            assert "Database unavailable." in notification.description
         
         @patch('ms_mint_app.plugins.processing.duckdb_connection')
         @patch('ms_mint_app.plugins.processing.create_pivot')
@@ -904,7 +899,7 @@ class TestStandaloneFunctions:
             
             assert notif is not None
             assert notif.type == "error"
-            assert "Could not delete the selected results" in notif.description
+            assert "Error: DB Error" in notif.description
             assert action_store == {'action': 'delete', 'status': 'failed'}
             assert total == [0, 0]
         
@@ -975,7 +970,7 @@ class TestStandaloneFunctions:
             
             assert notif is not None
             assert notif.type == "error"
-            assert "Could not delete all results" in notif.description
+            assert "Error: DB Error" in notif.description
             assert action_store == {'action': 'delete', 'status': 'failed'}
             assert total == [0, 0]
         
